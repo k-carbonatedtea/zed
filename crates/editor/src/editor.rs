@@ -233,7 +233,7 @@ use rand::seq::SliceRandom;
 use regex::Regex;
 use rpc::{ErrorCode, ErrorExt, proto::PeerId};
 use scroll::{Autoscroll, ScrollAnchor, ScrollManager, SharedScrollAnchor};
-use selections_collection::{GoalOrigins, MutableSelectionsCollection, SelectionsCollection};
+use selections_collection::{MutableSelectionsCollection, SelectionsCollection};
 use serde::{Deserialize, Serialize};
 use settings::{
     GitGutterSetting, RelativeLineNumbers, Settings, SettingsLocation, SettingsStore,
@@ -1203,6 +1203,7 @@ pub struct Editor {
         Option<Box<dyn Fn(Point, &mut Window, &mut Context<Self>) + 'static>>,
     suppress_selection_callback: bool,
     applicable_language_settings: HashMap<Option<LanguageName>, Arc<LanguageSettings>>,
+    semantic_token_only_buffers: Arc<HashSet<BufferId>>,
     accent_data: Option<AccentData>,
     bracket_fetched_tree_sitter_chunks: HashMap<Range<text::Anchor>, HashSet<Range<BufferRow>>>,
     semantic_token_state: SemanticTokenState,
@@ -1269,7 +1270,7 @@ pub struct EditorSnapshot {
     scroll_anchor: SharedScrollAnchor,
     current_line_highlight: CurrentLineHighlight,
     gutter_hovered: bool,
-    semantic_tokens_enabled: bool,
+    syntax: SyntaxStyling,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1332,7 +1333,6 @@ pub struct RemoteSelection {
 #[derive(Clone, Debug)]
 struct SelectionHistoryEntry {
     selections: Arc<[Selection<Anchor>]>,
-    goal_origins: GoalOrigins,
     select_next_state: Option<SelectNextState>,
     select_prev_state: Option<SelectNextState>,
     add_selections_state: Option<AddSelectionsState>,
@@ -1435,8 +1435,6 @@ pub struct TransactionSelections {
     pub redo: Option<Arc<[Selection<Anchor>]>>,
     undo_add_selections_state: Option<AddSelectionsState>,
     redo_add_selections_state: Option<AddSelectionsState>,
-    undo_goal_origins: GoalOrigins,
-    redo_goal_origins: GoalOrigins,
 }
 
 #[derive(Default)]
@@ -1454,7 +1452,6 @@ impl SelectionHistory {
         transaction_id: TransactionId,
         selections: Arc<[Selection<Anchor>]>,
         add_selections_state: Option<AddSelectionsState>,
-        goal_origins: GoalOrigins,
     ) {
         if selections.is_empty() {
             log::error!(
@@ -1470,8 +1467,6 @@ impl SelectionHistory {
                 redo: None,
                 undo_add_selections_state: add_selections_state,
                 redo_add_selections_state: None,
-                undo_goal_origins: goal_origins,
-                redo_goal_origins: GoalOrigins::default(),
             },
         );
     }
@@ -1652,6 +1647,7 @@ pub(crate) struct NavigationData {
     cursor_position: Point,
     scroll_anchor: ScrollAnchor,
     scroll_top_row: u32,
+    horizontal_scroll: Option<(Anchor, Point, ScrollPixelOffset)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2040,6 +2036,7 @@ impl Editor {
                     .into_any()
             }),
             merge_adjacent: true,
+            uniform_width: true,
             ..FoldPlaceholder::default()
         };
         let display_map = display_map.unwrap_or_else(|| {
@@ -2578,6 +2575,7 @@ impl Editor {
             on_local_selections_changed: None,
             suppress_selection_callback: false,
             applicable_language_settings: HashMap::default(),
+            semantic_token_only_buffers: Arc::default(),
             semantic_token_state: SemanticTokenState::new(cx, full_mode),
             accent_data: None,
             bracket_fetched_tree_sitter_chunks: HashMap::default(),
@@ -2610,6 +2608,7 @@ impl Editor {
         }
 
         editor.applicable_language_settings = editor.fetch_applicable_language_settings(cx);
+        editor.semantic_token_only_buffers = editor.fetch_semantic_token_only_buffers(cx);
         editor.accent_data = editor.fetch_accent_data(cx);
 
         if let Some(breakpoints) = editor.breakpoint_store.as_ref() {
@@ -2626,20 +2625,11 @@ impl Editor {
             window,
             |editor, _, e: &EditorEvent, window, cx| match e {
                 EditorEvent::ScrollPositionChanged { local, .. } => {
+                    let display_snapshot = editor.display_snapshot(cx);
+                    editor.persist_scroll_position(&display_snapshot, cx);
                     if *local {
                         editor.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
                         editor.hide_blame_popover(true, cx);
-                        let snapshot = editor.snapshot(window, cx);
-                        let new_anchor = editor
-                            .scroll_manager
-                            .native_anchor(&snapshot.display_snapshot, cx);
-                        editor.update_restoration_data(cx, move |data| {
-                            data.scroll_position = (
-                                new_anchor.top_row(snapshot.buffer_snapshot()),
-                                new_anchor.offset,
-                            );
-                        });
-
                         editor.update_data_on_scroll(true, window, cx);
                     }
                     editor.refresh_sticky_headers(&editor.snapshot(window, cx), cx);
@@ -3144,7 +3134,7 @@ impl Editor {
             show_line_numbers: self.show_line_numbers,
             number_deleted_lines: self.number_deleted_lines,
             show_git_diff_gutter: self.show_git_diff_gutter,
-            semantic_tokens_enabled: self.semantic_token_state.enabled(),
+            syntax: self.syntax_styling(),
             show_code_actions: self.show_code_actions,
             show_runnables: self.show_runnables,
             show_bookmarks: self.show_bookmarks,
@@ -4132,7 +4122,10 @@ impl Editor {
         cx: &App,
     ) -> Vec<Range<Point>> {
         let visible_range = self.multi_buffer_visible_range(display_snapshot, cx);
-        let Some(em_width) = display_snapshot.long_row_em_width() else {
+        let Some(visible_x) = display_snapshot
+            .long_row_em_width()
+            .and_then(|_| self.visible_x_range(display_snapshot, cx))
+        else {
             return vec![visible_range];
         };
         let rows = visible_range.start.to_display_point(display_snapshot).row()
@@ -4141,8 +4134,8 @@ impl Editor {
                 .to_display_point(display_snapshot)
                 .row()
                 .next_row();
-        let scroll_x = self.scroll_manager.scroll_position(display_snapshot, cx).x * em_width;
-        let viewport_width = self.visible_column_count().unwrap_or(0.) * em_width;
+        let scroll_x = *visible_x.start();
+        let viewport_width = *visible_x.end() - scroll_x;
         let text_align = self
             .style
             .as_ref()
@@ -8000,16 +7993,12 @@ impl Editor {
 
     fn restore_selections(
         &mut self,
-        selections: Option<(
-            Arc<[Selection<Anchor>]>,
-            Option<AddSelectionsState>,
-            GoalOrigins,
-        )>,
+        selections: Option<(Arc<[Selection<Anchor>]>, Option<AddSelectionsState>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((selections, add_selections_state, goal_origins)) =
-            selections.filter(|(selections, ..)| !selections.is_empty())
+        if let Some((selections, add_selections_state)) =
+            selections.filter(|(selections, _)| !selections.is_empty())
         {
             self.with_selection_effects_deferred(window, cx, |editor, window, cx| {
                 editor.change_selections(
@@ -8017,8 +8006,7 @@ impl Editor {
                     window,
                     cx,
                     |selection_collection| {
-                        selection_collection
-                            .select_anchors_unexpanded(selections.to_vec(), goal_origins);
+                        selection_collection.select_anchors_unexpanded(selections.to_vec());
                     },
                 );
                 editor.add_selections_state = add_selections_state;
@@ -8040,7 +8028,6 @@ impl Editor {
                 (
                     transaction.undo.clone(),
                     transaction.undo_add_selections_state.clone(),
-                    transaction.undo_goal_origins.clone(),
                 )
             });
             self.restore_selections(selections, window, cx);
@@ -8069,11 +8056,7 @@ impl Editor {
                     .transaction(transaction_id)
                     .and_then(|transaction| {
                         transaction.redo.clone().map(|selections| {
-                            (
-                                selections,
-                                transaction.redo_add_selections_state.clone(),
-                                transaction.redo_goal_origins.clone(),
-                            )
+                            (selections, transaction.redo_add_selections_state.clone())
                         })
                     });
             self.restore_selections(selections, window, cx);
@@ -8602,7 +8585,7 @@ impl Editor {
         buffers.retain(|buffer| !buffer.read(cx).read_only());
 
         let transaction_id_prev = buffer.read(cx).last_transaction_id(cx);
-        let (selections_prev, add_selections_state_prev, goal_origins_prev) = transaction_id_prev
+        let (selections_prev, add_selections_state_prev) = transaction_id_prev
             .and_then(|transaction_id_prev| {
                 // default to selections as they were after the last edit, if we have them,
                 // instead of how they are now.
@@ -8614,7 +8597,6 @@ impl Editor {
                         (
                             transaction.undo.clone(),
                             transaction.undo_add_selections_state.clone(),
-                            transaction.undo_goal_origins.clone(),
                         )
                     })
             })
@@ -8622,7 +8604,6 @@ impl Editor {
                 (
                     self.selections.disjoint_anchors_arc(),
                     self.add_selections_state.clone(),
-                    self.selections.goal_origins(),
                 )
             });
 
@@ -8660,7 +8641,6 @@ impl Editor {
                                 transaction_id_now,
                                 selections_prev,
                                 add_selections_state_prev,
-                                goal_origins_prev,
                             );
                         })
                         .ok();
@@ -8835,7 +8815,6 @@ impl Editor {
                 tx_id,
                 self.selections.disjoint_anchors_arc(),
                 self.add_selections_state.clone(),
-                self.selections.goal_origins(),
             );
             cx.emit(EditorEvent::TransactionBegun {
                 transaction_id: tx_id,
@@ -8858,7 +8837,6 @@ impl Editor {
             if let Some(transaction) = self.selection_history.transaction_mut(transaction_id) {
                 transaction.redo = Some(self.selections.disjoint_anchors_arc());
                 transaction.redo_add_selections_state = self.add_selections_state.clone();
-                transaction.redo_goal_origins = self.selections.goal_origins();
             } else {
                 log::error!("unexpectedly ended a transaction that wasn't started by this editor");
             }
@@ -8883,11 +8861,9 @@ impl Editor {
                 modify(transaction);
                 if undo != transaction.undo {
                     transaction.undo_add_selections_state = None;
-                    transaction.undo_goal_origins = GoalOrigins::default();
                 }
                 if redo != transaction.redo {
                     transaction.redo_add_selections_state = None;
-                    transaction.redo_goal_origins = GoalOrigins::default();
                 }
             })
             .is_some()
@@ -10218,6 +10194,7 @@ impl Editor {
                 }
                 self.refresh_document_highlights(cx);
                 let buffer_id = buffer.read(cx).remote_id();
+                self.update_semantic_token_only_buffer(buffer, cx);
                 if self.buffer.read(cx).diff_for(buffer_id).is_none()
                     && let Some(project) = self.project.clone()
                 {
@@ -10248,6 +10225,15 @@ impl Editor {
                     InlayHintRefreshReason::BuffersRemoved(removed_buffer_ids.clone()),
                     cx,
                 );
+                if removed_buffer_ids
+                    .iter()
+                    .any(|buffer_id| self.semantic_token_only_buffers.contains(buffer_id))
+                {
+                    let buffers = Arc::make_mut(&mut self.semantic_token_only_buffers);
+                    for buffer_id in removed_buffer_ids {
+                        buffers.remove(buffer_id);
+                    }
+                }
                 for buffer_id in removed_buffer_ids {
                     self.registered_buffers.remove(buffer_id);
                     self.clear_runnables(Some(*buffer_id));
@@ -10294,6 +10280,9 @@ impl Editor {
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
+                if let Some(buffer) = self.buffer.read(cx).buffer(*buffer_id) {
+                    self.update_semantic_token_only_buffer(&buffer, cx);
+                }
                 // No event exists for a buffer detaching from a language server: a switch
                 // to a language with no server emits neither LanguageServerRemoved nor
                 // LanguageServerBufferRegistered, so the language change itself is the only
@@ -10312,6 +10301,7 @@ impl Editor {
                 cx.notify();
             }
             multi_buffer::Event::SettingsChanged => {
+                self.refresh_semantic_token_only_buffers(cx);
                 let new_language_settings = self.fetch_applicable_language_settings(cx);
                 if new_language_settings != self.applicable_language_settings {
                     self.applicable_language_settings = new_language_settings;
@@ -10321,6 +10311,7 @@ impl Editor {
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
             multi_buffer::Event::Saved => cx.emit(EditorEvent::Saved),
             multi_buffer::Event::FileHandleChanged => {
+                self.refresh_semantic_token_only_buffers(cx);
                 cx.emit(EditorEvent::TitleChanged);
                 cx.emit(EditorEvent::FileHandleChanged);
             }
@@ -10341,10 +10332,11 @@ impl Editor {
     fn on_display_map_changed(
         &mut self,
         _: Entity<DisplayMap>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.inlay_hint_visibility_changed(cx);
+        self.settle_horizontal_goals(window, cx);
         cx.notify();
     }
 
@@ -10409,10 +10401,64 @@ impl Editor {
         )
     }
 
+    fn fetch_semantic_token_only_buffers(&self, cx: &App) -> Arc<HashSet<BufferId>> {
+        Arc::new(
+            self.buffer()
+                .read(cx)
+                .all_buffers()
+                .into_iter()
+                .filter_map(|buffer| {
+                    let buffer = buffer.read(cx);
+                    (!LanguageSettings::for_buffer(buffer, cx)
+                        .semantic_tokens
+                        .use_tree_sitter())
+                    .then(|| buffer.remote_id())
+                })
+                .collect(),
+        )
+    }
+
+    fn update_semantic_token_only_buffer(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let buffer = buffer.read(cx);
+        let buffer_id = buffer.remote_id();
+        let semantic_tokens_only = !LanguageSettings::for_buffer(buffer, cx)
+            .semantic_tokens
+            .use_tree_sitter();
+        if semantic_tokens_only != self.semantic_token_only_buffers.contains(&buffer_id) {
+            let buffers = Arc::make_mut(&mut self.semantic_token_only_buffers);
+            if semantic_tokens_only {
+                buffers.insert(buffer_id);
+            } else {
+                buffers.remove(&buffer_id);
+            }
+            cx.notify();
+        }
+    }
+
+    fn refresh_semantic_token_only_buffers(&mut self, cx: &mut Context<Self>) {
+        let buffers = self.fetch_semantic_token_only_buffers(cx);
+        if buffers != self.semantic_token_only_buffers {
+            self.semantic_token_only_buffers = buffers;
+            cx.notify();
+        }
+    }
+
+    fn syntax_styling(&self) -> SyntaxStyling {
+        SyntaxStyling {
+            semantic_tokens_enabled: self.semantic_token_state.enabled(),
+            semantic_token_only_buffers: self.semantic_token_only_buffers.clone(),
+        }
+    }
+
     fn settings_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let new_language_settings = self.fetch_applicable_language_settings(cx);
         let language_settings_changed = new_language_settings != self.applicable_language_settings;
         self.applicable_language_settings = new_language_settings;
+        self.refresh_semantic_token_only_buffers(cx);
 
         let new_accents = self.fetch_accent_data(cx);
         let accents_changed = new_accents != self.accent_data;
@@ -11244,7 +11290,7 @@ impl Editor {
             return None;
         }
         let source_x = editor_snapshot.x_for_display_point(source, &text_layout_details)
-            - self.horizontal_scroll_pixels(scroll_position.x, &text_layout_details, window);
+            - self.horizontal_scroll_pixels(scroll_position.x, window, cx);
         let source_y = line_height * (source.row().as_f64() - scroll_top) as f32;
         Some(gpui::Point::new(Pixels::from(source_x), source_y))
     }
@@ -11287,23 +11333,6 @@ impl Editor {
             em_width,
             line_height,
         }
-    }
-
-    fn horizontal_scroll_pixels(
-        &self,
-        scroll_x: ScrollOffset,
-        text_layout_details: &TextLayoutDetails,
-        window: &Window,
-    ) -> ScrollPixelOffset {
-        let text_style = &text_layout_details.editor_style.text;
-        let font_id = text_layout_details
-            .text_system
-            .resolve_font(&text_style.font());
-        let font_size = text_style.font_size.to_pixels(text_layout_details.rem_size);
-        let em_layout_width = text_layout_details
-            .text_system
-            .em_layout_width(font_id, font_size);
-        window.pixel_snap_f64(scroll_x * ScrollPixelOffset::from(em_layout_width))
     }
 
     pub fn wait_for_diff_to_load(&self) -> Option<Shared<Task<()>>> {
@@ -12269,6 +12298,53 @@ impl EditorSnapshot {
         )
     }
 
+    fn remote_selections<'a>(
+        &'a self,
+        selections: impl 'a + IntoIterator<Item = (ReplicaId, bool, CursorShape, Selection<Anchor>)>,
+        collaboration_hub: &dyn CollaborationHub,
+        cx: &'a App,
+    ) -> impl 'a + Iterator<Item = RemoteSelection> {
+        let participant_names = collaboration_hub.user_names(cx);
+        let participant_indices = collaboration_hub.user_participant_indices(cx);
+        let collaborators_by_peer_id = collaboration_hub.collaborators(cx);
+        let collaborators_by_replica_id = collaborators_by_peer_id
+            .values()
+            .map(|collaborator| (collaborator.replica_id, collaborator))
+            .collect::<HashMap<_, _>>();
+        selections.into_iter().filter_map(
+            move |(replica_id, line_mode, cursor_shape, selection)| {
+                if replica_id == ReplicaId::AGENT {
+                    Some(RemoteSelection {
+                        replica_id,
+                        selection,
+                        cursor_shape,
+                        line_mode,
+                        collaborator_id: CollaboratorId::Agent,
+                        user_name: Some("Agent".into()),
+                        color: cx.theme().players().agent(),
+                    })
+                } else {
+                    let collaborator = collaborators_by_replica_id.get(&replica_id)?;
+                    let participant_index = participant_indices.get(&collaborator.user_id).copied();
+                    let user_name = participant_names.get(&collaborator.user_id).cloned();
+                    Some(RemoteSelection {
+                        replica_id,
+                        selection,
+                        cursor_shape,
+                        line_mode,
+                        collaborator_id: CollaboratorId::PeerId(collaborator.peer_id),
+                        user_name,
+                        color: if let Some(index) = participant_index {
+                            cx.theme().players().color_for_participant(index.0)
+                        } else {
+                            cx.theme().players().absent()
+                        },
+                    })
+                }
+            },
+        )
+    }
+
     pub fn language_at<T: ToOffset>(&self, position: T) -> Option<&Arc<Language>> {
         self.display_snapshot
             .buffer_snapshot()
@@ -12609,51 +12685,6 @@ impl EditorSnapshot {
                 (relative_line_number != 0 || is_deleted).then_some((row, relative_line_number))
             })
             .collect()
-    }
-
-    fn remote_selections<'a>(
-        &'a self,
-        selections: impl 'a + Iterator<Item = (ReplicaId, bool, CursorShape, Selection<Anchor>)>,
-        collaboration_hub: &dyn CollaborationHub,
-        cx: &'a App,
-    ) -> impl 'a + Iterator<Item = RemoteSelection> {
-        let participant_names = collaboration_hub.user_names(cx);
-        let participant_indices = collaboration_hub.user_participant_indices(cx);
-        let collaborators_by_peer_id = collaboration_hub.collaborators(cx);
-        let collaborators_by_replica_id = collaborators_by_peer_id
-            .values()
-            .map(|collaborator| (collaborator.replica_id, collaborator))
-            .collect::<HashMap<_, _>>();
-        selections.filter_map(move |(replica_id, line_mode, cursor_shape, selection)| {
-            if replica_id == ReplicaId::AGENT {
-                Some(RemoteSelection {
-                    replica_id,
-                    selection,
-                    cursor_shape,
-                    line_mode,
-                    collaborator_id: CollaboratorId::Agent,
-                    user_name: Some("Agent".into()),
-                    color: cx.theme().players().agent(),
-                })
-            } else {
-                let collaborator = collaborators_by_replica_id.get(&replica_id)?;
-                let participant_index = participant_indices.get(&collaborator.user_id).copied();
-                let user_name = participant_names.get(&collaborator.user_id).cloned();
-                Some(RemoteSelection {
-                    replica_id,
-                    selection,
-                    cursor_shape,
-                    line_mode,
-                    collaborator_id: CollaboratorId::PeerId(collaborator.peer_id),
-                    user_name,
-                    color: if let Some(index) = participant_index {
-                        cx.theme().players().color_for_participant(index.0)
-                    } else {
-                        cx.theme().players().absent()
-                    },
-                })
-            }
-        })
     }
 }
 

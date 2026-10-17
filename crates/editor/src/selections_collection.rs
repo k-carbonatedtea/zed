@@ -1,24 +1,27 @@
+mod horizontal_goals;
+
 use std::{
     cmp,
     collections::BTreeMap,
     fmt, iter, mem,
     ops::{AddAssign, Deref, DerefMut, Range, Sub},
+    slice,
     sync::Arc,
 };
 
-use collections::HashMap;
 use itertools::{Either, Itertools as _};
 use language::{Bias, Point, Selection, SelectionGoal};
 use multi_buffer::{MultiBufferDimension, MultiBufferOffset, ToPoint};
-use smallvec::{SmallVec, smallvec};
 
 use crate::{
     Anchor, DisplayPoint, DisplayRow, MultiBufferSnapshot, SelectMode, ToOffset,
     columnar_selection::ColumnarSelectionRows,
-    display_map::{DisplaySnapshot, POSITION_TOLERANCE, ToDisplayPoint},
+    display_map::{DisplaySnapshot, ToDisplayPoint},
     movement::TextLayoutDetails,
     scroll::ScrollPixelOffset,
 };
+use horizontal_goals::HorizontalGoals;
+pub(crate) use horizontal_goals::HorizontalOrigins;
 
 #[derive(Debug, Clone)]
 pub struct PendingSelection {
@@ -37,18 +40,7 @@ pub struct SelectionsCollection {
     pending: Option<PendingSelection>,
     select_mode: SelectMode,
     is_extending: bool,
-    goal_epoch: usize,
-    goal_origins: GoalOrigins,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct GoalOrigins(Arc<HashMap<usize, SmallVec<[GoalOrigin; 2]>>>);
-
-#[derive(Debug, Clone, Copy)]
-struct GoalOrigin {
-    x: ScrollPixelOffset,
-    anchor: Anchor,
-    text_id: usize,
+    horizontal_goals: HorizontalGoals,
 }
 
 impl SelectionsCollection {
@@ -69,8 +61,7 @@ impl SelectionsCollection {
             }),
             select_mode: SelectMode::Character,
             is_extending: false,
-            goal_epoch: 0,
-            goal_origins: GoalOrigins::default(),
+            horizontal_goals: HorizontalGoals::default(),
         }
     }
 
@@ -79,12 +70,7 @@ impl SelectionsCollection {
         self.line_mode = other.line_mode;
         self.disjoint = other.disjoint.clone();
         self.pending.clone_from(&other.pending);
-        self.goal_epoch = other.goal_epoch;
-        self.goal_origins = other.goal_origins.clone();
-    }
-
-    pub(crate) fn goal_origins(&self) -> GoalOrigins {
-        self.goal_origins.clone()
+        self.horizontal_goals.clear_provisional();
     }
 
     pub fn count(&self) -> usize {
@@ -284,6 +270,28 @@ impl SelectionsCollection {
                     && selection.start.to_offset(buffer) != selection.end.to_offset(buffer)
             })
         })
+    }
+
+    pub fn overlaps_range(&self, range: &Range<Anchor>, snapshot: &DisplaySnapshot) -> bool {
+        let buffer = snapshot.buffer_snapshot();
+        let start = range.start.to_point(buffer);
+        let end = range.end.to_point(buffer);
+        self.disjoint_in_ranges::<Point>(slice::from_ref(range), snapshot)
+            .into_iter()
+            .chain(self.pending::<Point>(snapshot))
+            .any(|selection| selection.end > start && selection.start < end)
+    }
+
+    pub fn any_head_in(
+        &self,
+        range: Range<Anchor>,
+        snapshot: &DisplaySnapshot,
+        mut predicate: impl FnMut(DisplayPoint) -> bool,
+    ) -> bool {
+        self.disjoint_in_range::<Point>(range, snapshot)
+            .into_iter()
+            .chain(self.pending::<Point>(snapshot))
+            .any(|selection| predicate(selection.head().to_display_point(snapshot)))
     }
 
     pub fn disjoint_in_ranges<D>(
@@ -672,16 +680,12 @@ impl SelectionsCollection {
         snapshot: &DisplaySnapshot,
         change: impl FnOnce(&mut MutableSelectionsCollection<'_, '_>) -> R,
     ) -> (bool, R) {
-        if self.goal_epoch != snapshot.long_row_epoch() {
-            self.goal_epoch = snapshot.long_row_epoch();
-            self.rebase_goals(snapshot);
-        }
+        let settled = self.settle_horizontal_goals(snapshot);
         let previous_disjoint = self.disjoint.clone();
-        let previous_pending = self.pending_anchor().copied();
         let mut mutable_collection = MutableSelectionsCollection {
             snapshot,
             collection: self,
-            selections_changed: false,
+            selections_changed: settled,
         };
 
         let result = change(&mut mutable_collection);
@@ -730,8 +734,33 @@ impl SelectionsCollection {
             }
         }
         let selections_changed = mutable_collection.selections_changed;
-        self.track_goal_origins(snapshot, &previous_disjoint, previous_pending);
+        if !Arc::ptr_eq(&previous_disjoint, &self.disjoint)
+            || self.horizontal_goals.has_recorded_origins()
+        {
+            self.horizontal_goals
+                .capture(self.disjoint.iter(), snapshot);
+        }
         (selections_changed, result)
+    }
+
+    pub(crate) fn horizontal_origins(&self) -> HorizontalOrigins {
+        self.horizontal_goals.origins()
+    }
+
+    pub(crate) fn copy_horizontal_goal(&mut self, from: usize, to: usize) {
+        self.horizontal_goals.copy_goal(from, to);
+    }
+
+    pub(crate) fn has_provisional_horizontal_goals(&self) -> bool {
+        self.horizontal_goals.has_provisional()
+    }
+
+    pub(crate) fn has_unsettled_horizontal_goals(&self, snapshot: &DisplaySnapshot) -> bool {
+        self.pending.is_none() && self.horizontal_goals.is_unsettled(snapshot)
+    }
+
+    pub(crate) fn set_horizontal_layout_details(&mut self, details: &TextLayoutDetails) {
+        self.horizontal_goals.set_details(details);
     }
 
     pub fn next_selection_id(&self) -> usize {
@@ -768,172 +797,25 @@ impl SelectionsCollection {
         id
     }
 
-    fn track_goal_origins(
-        &mut self,
-        snapshot: &DisplaySnapshot,
-        previous_disjoint: &Arc<[Selection<Anchor>]>,
-        previous_pending: Option<Selection<Anchor>>,
-    ) {
-        if Arc::ptr_eq(previous_disjoint, &self.disjoint)
-            && previous_pending == self.pending_anchor().copied()
-        {
-            return;
+    fn settle_horizontal_goals(&mut self, snapshot: &DisplaySnapshot) -> bool {
+        if self.pending.is_some() {
+            return false;
         }
-        let mut previous_by_id = None::<HashMap<usize, Selection<Anchor>>>;
-        let mut origins = HashMap::default();
-        for selection in self
-            .disjoint
-            .iter()
-            .chain(self.pending.as_ref().map(|pending| &pending.selection))
-        {
-            let positions = goal_positions(selection.goal);
-            if positions.is_empty() {
-                continue;
-            }
-            let known_origins = self.goal_origins.0.get(&selection.id);
-            let previous_by_id = previous_by_id.get_or_insert_with(|| {
-                previous_disjoint
-                    .iter()
-                    .chain(previous_pending.as_ref())
-                    .map(|previous| (previous.id, *previous))
-                    .collect()
-            });
-            let previous = previous_by_id.get(&selection.id);
-            let tracked = positions
-                .into_iter()
-                .filter_map(|x| {
-                    if let Some(origin) = known_origins
-                        .and_then(|origins| origins.iter().find(|origin| origin.x == x))
-                    {
-                        return Some(*origin);
-                    }
-                    let previous = previous?;
-                    if goal_positions(previous.goal).contains(&x) {
-                        return None;
-                    }
-                    goal_origin(snapshot, previous, x)
-                })
-                .collect::<SmallVec<[GoalOrigin; 2]>>();
-            if !tracked.is_empty() {
-                origins.insert(selection.id, tracked);
-            }
-        }
-        if !origins.is_empty() || !self.goal_origins.0.is_empty() {
-            self.goal_origins = GoalOrigins(Arc::new(origins));
-        }
-    }
-
-    fn rebase_goals(&mut self, snapshot: &DisplaySnapshot) {
-        if self.goal_origins.0.is_empty() {
-            return;
-        }
-        let mut origins = HashMap::default();
-        let mut moves =
-            HashMap::<usize, SmallVec<[(ScrollPixelOffset, ScrollPixelOffset); 2]>>::default();
-        for (id, selection_origins) in self.goal_origins.0.iter() {
-            let selection_origins = selection_origins
-                .iter()
-                .filter_map(|origin| {
-                    let (x, text_id) = long_row_x(snapshot, origin.anchor)?;
-                    if text_id != origin.text_id {
-                        return None;
-                    }
-                    if (x - origin.x).abs() <= POSITION_TOLERANCE {
-                        return Some(*origin);
-                    }
-                    moves.entry(*id).or_default().push((origin.x, x));
-                    Some(GoalOrigin { x, ..*origin })
-                })
-                .collect::<SmallVec<[GoalOrigin; 2]>>();
-            if !selection_origins.is_empty() {
-                origins.insert(*id, selection_origins);
-            }
-        }
-        self.goal_origins = GoalOrigins(Arc::new(origins));
-        if moves.is_empty() {
-            return;
-        }
-        let rebase = |selection: &Selection<Anchor>| {
-            let Some(moves) = moves.get(&selection.id) else {
-                return *selection;
-            };
-            Selection {
-                goal: map_goal_positions(selection.goal, |x| {
-                    moves
-                        .iter()
-                        .find(|(old_x, _)| *old_x == x)
-                        .map_or(x, |(_, new_x)| *new_x)
-                }),
-                ..*selection
-            }
+        let Some(selections) = self.horizontal_goals.settle(&self.disjoint, snapshot) else {
+            return false;
         };
-        self.disjoint = self.disjoint.iter().map(rebase).collect();
-        if let Some(pending) = &mut self.pending {
-            pending.selection = rebase(&pending.selection);
+        let select_mode = self.select_mode.clone();
+        MutableSelectionsCollection {
+            snapshot,
+            collection: self,
+            selections_changed: false,
         }
+        .select(selections);
+        self.select_mode = select_mode;
+        self.horizontal_goals
+            .capture_settled(self.disjoint.iter(), snapshot);
+        true
     }
-}
-
-fn goal_positions(goal: SelectionGoal) -> SmallVec<[ScrollPixelOffset; 2]> {
-    let mut positions: SmallVec<[ScrollPixelOffset; 2]> = match goal {
-        SelectionGoal::None => SmallVec::new(),
-        SelectionGoal::HorizontalPosition(x) | SelectionGoal::WrappedHorizontalPosition((_, x)) => {
-            smallvec![x]
-        }
-        SelectionGoal::HorizontalRange { start, end } => smallvec![start, end],
-    };
-    positions.retain(|x| x.is_finite());
-    positions
-}
-
-fn map_goal_positions(
-    goal: SelectionGoal,
-    map: impl Fn(ScrollPixelOffset) -> ScrollPixelOffset,
-) -> SelectionGoal {
-    let map = |x: ScrollPixelOffset| if x.is_finite() { map(x) } else { x };
-    match goal {
-        SelectionGoal::None => SelectionGoal::None,
-        SelectionGoal::HorizontalPosition(x) => SelectionGoal::HorizontalPosition(map(x)),
-        SelectionGoal::WrappedHorizontalPosition((row, x)) => {
-            SelectionGoal::WrappedHorizontalPosition((row, map(x)))
-        }
-        SelectionGoal::HorizontalRange { start, end } => SelectionGoal::HorizontalRange {
-            start: map(start),
-            end: map(end),
-        },
-    }
-}
-
-fn goal_origin(
-    snapshot: &DisplaySnapshot,
-    selection: &Selection<Anchor>,
-    x: ScrollPixelOffset,
-) -> Option<GoalOrigin> {
-    let origin = |anchor: Anchor| {
-        long_row_x(snapshot, anchor)
-            .filter(|(candidate_x, text_id)| {
-                *text_id != 0 && (candidate_x - x).abs() <= POSITION_TOLERANCE
-            })
-            .map(|(_, text_id)| GoalOrigin { x, anchor, text_id })
-    };
-    let head = selection.head();
-    let before_head = || {
-        let point = head.to_display_point(snapshot);
-        let column = point.column().checked_sub(1)?;
-        let column = snapshot.long_row(point.row())?.floor_column(column);
-        let offset = DisplayPoint::new(point.row(), column).to_offset(snapshot, Bias::Left);
-        Some(snapshot.buffer_snapshot().anchor_before(offset))
-    };
-    [head, selection.tail()]
-        .into_iter()
-        .find_map(origin)
-        .or_else(|| before_head().and_then(origin))
-}
-
-fn long_row_x(snapshot: &DisplaySnapshot, anchor: Anchor) -> Option<(ScrollPixelOffset, usize)> {
-    let point = anchor.to_display_point(snapshot);
-    let long_row = snapshot.long_row(point.row())?;
-    Some((long_row.x_for_column(point.column()), long_row.text_id()))
 }
 
 pub struct MutableSelectionsCollection<'snap, 'a> {
@@ -1263,8 +1145,10 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
             .iter()
             .sorted_by(|first, second| Ord::cmp(&second.id, &first.id))
         {
+            let id = self.new_selection_id();
+            self.horizontal_goals.copy_goal(selection.id, id);
             new_selections.push(Selection {
-                id: self.new_selection_id(),
+                id,
                 start: selection
                     .start
                     .to_display_point(self.snapshot)
@@ -1287,11 +1171,20 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         let mut changed = false;
         let display_map = self.display_snapshot();
         let selections = self.collection.all_display(&display_map);
+        let origins = display_map
+            .may_have_long_rows()
+            .then(|| self.collection.horizontal_origins());
         let selections = selections
             .into_iter()
             .map(|selection| {
                 let mut moved_selection = selection;
+                if let Some(origins) = &origins {
+                    origins.set_selection(Some(selection.id));
+                }
                 move_selection(&display_map, &mut moved_selection);
+                if let Some(origins) = &origins {
+                    origins.set_selection(None);
+                }
                 if selection != moved_selection {
                     changed = true;
                 }
@@ -1395,15 +1288,8 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         self.pending.as_mut().map(|pending| &mut pending.selection)
     }
 
-    pub(crate) fn select_anchors_unexpanded(
-        &mut self,
-        selections: Vec<Selection<Anchor>>,
-        goal_origins: GoalOrigins,
-    ) {
+    pub(crate) fn select_anchors_unexpanded(&mut self, selections: Vec<Selection<Anchor>>) {
         self.select(selections);
-        self.collection.goal_origins = goal_origins;
-        let snapshot = self.snapshot;
-        self.collection.rebase_goals(snapshot);
     }
 }
 
@@ -1897,7 +1783,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut collection = SelectionsCollection::new();
         collection.change_with(&snapshot, |selections| {
-            selections.select_anchors_unexpanded(anchors, GoalOrigins::default());
+            selections.select_anchors_unexpanded(anchors);
         });
         assert_eq!(collection.all_unexpanded::<Point>(&snapshot), saved);
         assert_eq!(collection.pending_anchor(), None);
@@ -1916,7 +1802,6 @@ mod tests {
                         )
                     })
                     .collect(),
-                GoalOrigins::default(),
             );
         });
         assert_eq!(

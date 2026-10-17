@@ -52,9 +52,9 @@ pub struct WrapMap {
     wrap_width: Option<Pixels>,
     soft_wrap_indent: SoftWrapIndent,
     background_task: Option<Task<()>>,
-    font_with_size: (Font, Pixels),
+    pub(super) font_with_size: (Font, Pixels),
     long_rows_task: Option<Task<()>>,
-    long_row_edits: Vec<(TabSnapshot, Vec<TabEdit>)>,
+    long_row_edits: Patch<Point>,
 }
 
 #[derive(Clone)]
@@ -129,7 +129,7 @@ impl LineFragmentBuilder {
     ) {
         self.renderer_run = None;
         let mut prefix_start = 0;
-        for range in self.standalone_invisibles.find(text, next) {
+        for range in self.standalone_invisibles.find(text, next, false) {
             let Some(width) = text[range.clone()]
                 .chars()
                 .next()
@@ -239,7 +239,7 @@ impl WrapMap {
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
                 long_rows_task: None,
-                long_row_edits: Vec::new(),
+                long_row_edits: Patch::default(),
             };
             if !this.set_wrap_width(wrap_width, cx) {
                 this.rewrap(cx);
@@ -266,13 +266,18 @@ impl WrapMap {
             self.pending_edits.push_back((tab_snapshot, edits));
             self.flush_edits(cx);
         } else {
+            self.adopt_long_row_refinements();
             self.edits_since_sync = self
                 .edits_since_sync
                 .compose(self.snapshot.interpolate(tab_snapshot, &edits));
             self.snapshot.interpolated = false;
             if self.long_rows_task.is_some() && !edits.is_empty() {
-                self.long_row_edits
-                    .push((self.snapshot.tab_snapshot.clone(), edits));
+                self.long_row_edits =
+                    self.long_row_edits
+                        .compose(edits.iter().map(|edit| text::Edit {
+                            old: edit.old.start.0..edit.old.end.0,
+                            new: edit.new.start.0..edit.new.end.0,
+                        }));
             }
             self.measure_long_rows(Duration::from_millis(1), cx);
         }
@@ -435,7 +440,12 @@ impl WrapMap {
         }
     }
 
-    pub(crate) fn measure_long_row_columns(&mut self, requests: &[MeasureRequest]) -> bool {
+    pub(crate) fn measure_long_row_columns(
+        &mut self,
+        requests: &[MeasureRequest],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let adopted = self.adopt_long_row_refinements();
         match self
             .snapshot
             .long_rows
@@ -443,10 +453,23 @@ impl WrapMap {
         {
             Some(long_rows) => {
                 self.snapshot.long_rows = long_rows;
+                self.measure_long_rows(Duration::ZERO, cx);
                 true
             }
-            None => false,
+            None => adopted,
         }
+    }
+
+    fn adopt_long_row_refinements(&mut self) -> bool {
+        let Some(long_rows) = self
+            .snapshot
+            .long_rows
+            .adopt_refinements(&self.snapshot.tab_snapshot)
+        else {
+            return false;
+        };
+        self.snapshot.long_rows = long_rows;
+        true
     }
 
     fn measure_long_rows(&mut self, timeout: Duration, cx: &mut Context<Self>) {
@@ -459,15 +482,32 @@ impl WrapMap {
             cx.text_system().line_wrapper(font, font_size),
         ));
         match cx.foreground_executor().block_with_timeout(timeout, task) {
-            Ok(long_rows) => self.snapshot.long_rows = long_rows,
+            Ok(long_rows) => {
+                self.snapshot.long_rows = self
+                    .snapshot
+                    .long_rows
+                    .absorb(&self.snapshot.tab_snapshot, long_rows)
+            }
             Err(task) => {
                 self.long_rows_task = Some(cx.spawn(async move |wrap_map, cx| {
                     let long_rows = task.await;
                     wrap_map
                         .update(cx, |wrap_map, cx| {
                             wrap_map.long_rows_task = None;
-                            wrap_map.snapshot.long_rows =
-                                long_rows.replay(mem::take(&mut wrap_map.long_row_edits));
+                            let edits = mem::take(&mut wrap_map.long_row_edits)
+                                .into_inner()
+                                .into_iter()
+                                .map(|edit| TabEdit {
+                                    old: TabPoint(edit.old.start)..TabPoint(edit.old.end),
+                                    new: TabPoint(edit.new.start)..TabPoint(edit.new.end),
+                                })
+                                .collect::<Vec<_>>();
+                            let measured =
+                                long_rows.interpolate(&wrap_map.snapshot.tab_snapshot, &edits);
+                            wrap_map.snapshot.long_rows = wrap_map
+                                .snapshot
+                                .long_rows
+                                .absorb(&wrap_map.snapshot.tab_snapshot, measured);
                             wrap_map.measure_long_rows(Duration::from_millis(1), cx);
                             cx.notify();
                         })

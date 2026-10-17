@@ -9,6 +9,7 @@ use gpui::{
 };
 use indoc::indoc;
 use language::EditPredictionsMode;
+use language::language_settings::SoftWrap;
 use language::{Buffer, CodeLabel};
 use multi_buffer::{Anchor, MultiBufferSnapshot, ToPoint};
 use project::{Completion, CompletionResponse, CompletionSource};
@@ -22,14 +23,15 @@ use std::{
     },
     time::Duration,
 };
-use text::{Point, ToOffset};
+use text::{Bias, Point, ToOffset};
 use ui::prelude::*;
 
 use crate::{
-    AcceptEditPrediction, CodeContextMenu, CompletionContext, CompletionProvider, EditPrediction,
-    EditPredictionKeybindAction, EditPredictionKeybindSurface, MenuEditPredictionsPolicy,
-    MultiBuffer, ShowCompletions,
+    AcceptEditPrediction, CodeContextMenu, CompletionContext, CompletionProvider, DisplayPoint,
+    EditPrediction, EditPredictionKeybindAction, EditPredictionKeybindSurface,
+    MenuEditPredictionsPolicy, MultiBuffer, ShowCompletions,
     editor_tests::{init_test, update_test_language_settings},
+    inlays::Inlay,
     test::{
         build_editor, editor_lsp_test_context::EditorLspTestContext,
         editor_test_context::EditorTestContext,
@@ -372,6 +374,147 @@ async fn test_edit_prediction_jump_button(cx: &mut gpui::TestAppContext) {
         line 3
         line 4
     "});
+}
+
+#[gpui::test]
+async fn test_edit_prediction_preview_jump_to_horizontally_offscreen_target(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (mut cx, provider) = modifier_preview_test_context(cx).await;
+    let long_row = "x".repeat(100_000);
+    let trailing_rows = "\n".repeat(40);
+    cx.set_state(&format!("xˇ\nx\nx\nx\nx\nx\n{long_row}{trailing_rows}"));
+    draw_editor(&mut cx);
+
+    let right_target = Point::new(6, 90_000);
+    propose_edits(&provider, vec![(right_target..right_target, "y")], &mut cx);
+    cx.update_editor(|editor, window, cx| editor.update_visible_edit_prediction(window, cx));
+    assert_editor_active_move_completion(&mut cx, |snapshot, target| {
+        assert_eq!(target.to_point(&snapshot), right_target);
+    });
+
+    cx.simulate_modifiers_change(Modifiers::control());
+    draw_editor(&mut cx);
+    assert_line_popover_within_text_bounds(&mut cx);
+
+    accept_completion(&mut cx);
+    draw_editor(&mut cx);
+    assert_eq!(newest_cursor(&mut cx), Point::new(0, 1));
+    assert_line_popover_within_text_bounds(&mut cx);
+    assert!(editor_scroll_position(&mut cx).x > 0.);
+
+    cx.simulate_modifiers_change(Modifiers::none());
+    draw_editor(&mut cx);
+    assert_eq!(editor_scroll_position(&mut cx), gpui::Point::new(0., 0.));
+
+    cx.simulate_modifiers_change(Modifiers::control());
+    draw_editor(&mut cx);
+    accept_completion(&mut cx);
+    draw_editor(&mut cx);
+    accept_completion(&mut cx);
+    assert_eq!(newest_cursor(&mut cx), right_target);
+
+    cx.simulate_modifiers_change(Modifiers::none());
+    draw_editor(&mut cx);
+    let scrolled_right_position = editor_scroll_position(&mut cx);
+    assert!(scrolled_right_position.x > 0.);
+
+    let left_target = Point::new(2, 1);
+    propose_edits(&provider, vec![(left_target..left_target, "y")], &mut cx);
+    cx.update_editor(|editor, window, cx| editor.update_visible_edit_prediction(window, cx));
+    cx.simulate_modifiers_change(Modifiers::control());
+    draw_editor(&mut cx);
+    assert_line_popover_within_text_bounds(&mut cx);
+
+    accept_completion(&mut cx);
+    draw_editor(&mut cx);
+    assert_eq!(newest_cursor(&mut cx), right_target);
+    assert_eq!(editor_scroll_position(&mut cx).x, 0.);
+    assert_line_popover_within_text_bounds(&mut cx);
+
+    cx.simulate_modifiers_change(Modifiers::none());
+    draw_editor(&mut cx);
+    assert_eq!(editor_scroll_position(&mut cx), scrolled_right_position);
+}
+
+#[gpui::test]
+async fn test_edit_prediction_preview_jump_to_vertically_offscreen_target(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (mut cx, provider) = modifier_preview_test_context(cx).await;
+    let rows = "\nx".repeat(80);
+    let half_row = "x".repeat(50_000);
+    cx.set_state(&format!("{half_row}ˇ{half_row}{rows}"));
+    draw_editor(&mut cx);
+
+    let target = Point::new(70, 0);
+    propose_edits(&provider, vec![(target..target, "y")], &mut cx);
+    cx.update_editor(|editor, window, cx| editor.update_visible_edit_prediction(window, cx));
+    cx.simulate_modifiers_change(Modifiers::control());
+    for scroll_x in [0., 60_000.] {
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(gpui::Point::new(scroll_x, 0.), window, cx);
+        });
+        draw_editor(&mut cx);
+        assert_line_popover_within_text_bounds(&mut cx);
+    }
+    let previous_scroll_position = editor_scroll_position(&mut cx);
+
+    accept_completion(&mut cx);
+    draw_editor(&mut cx);
+    assert_eq!(newest_cursor(&mut cx), Point::new(0, 50_000));
+    let preview_scroll_position = editor_scroll_position(&mut cx);
+    assert_eq!(preview_scroll_position.x, 0.);
+    assert!(preview_scroll_position.y > 0.);
+
+    cx.simulate_modifiers_change(Modifiers::none());
+    draw_editor(&mut cx);
+    assert_eq!(editor_scroll_position(&mut cx), previous_scroll_position);
+}
+
+#[gpui::test]
+async fn test_edit_prediction_preview_release_restores_horizontal_text_anchor(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (mut cx, provider) = modifier_preview_test_context(cx).await;
+    let half_row = "x".repeat(50_000);
+    let trailing_rows = "\nx".repeat(80);
+    cx.set_state(&format!("{half_row}ˇ{half_row}{trailing_rows}"));
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::Point::new(49_990., 0.), window, cx);
+    });
+    draw_editor(&mut cx);
+    cx.run_until_parked();
+    draw_editor(&mut cx);
+    let original_left_edge = left_edge_point(&mut cx);
+
+    let target = Point::new(70, 0);
+    propose_edits(&provider, vec![(target..target, "y")], &mut cx);
+    cx.update_editor(|editor, window, cx| editor.update_visible_edit_prediction(window, cx));
+    cx.simulate_modifiers_change(Modifiers::control());
+    draw_editor(&mut cx);
+    accept_completion(&mut cx);
+    draw_editor(&mut cx);
+    assert_eq!(newest_cursor(&mut cx), Point::new(0, 50_000));
+    assert_eq!(editor_scroll_position(&mut cx).x, 0.);
+
+    cx.update_editor(|editor, _, cx| {
+        let position = editor
+            .buffer()
+            .read(cx)
+            .snapshot(cx)
+            .anchor_after(Point::new(0, 10));
+        editor.splice_inlays(
+            &[],
+            vec![Inlay::mock_hint(0, position, "h".repeat(500))],
+            cx,
+        );
+    });
+    cx.simulate_modifiers_change(Modifiers::none());
+    draw_editor(&mut cx);
+    cx.run_until_parked();
+    draw_editor(&mut cx);
+    assert_eq!(left_edge_point(&mut cx), original_left_edge);
 }
 
 #[gpui::test]
@@ -1901,4 +2044,77 @@ impl EditPredictionDelegate for FakeNonZedEditPredictionDelegate {
     ) -> Option<edit_prediction_types::EditPrediction> {
         self.completion.clone()
     }
+}
+
+async fn modifier_preview_test_context(
+    cx: &mut gpui::TestAppContext,
+) -> (EditorTestContext, Entity<FakeEditPredictionDelegate>) {
+    init_test(cx, |_| {});
+    update_test_language_settings(cx, &|settings| {
+        settings.defaults.soft_wrap = Some(SoftWrap::None);
+        settings.edit_predictions.get_or_insert_default().mode = Some(EditPredictionsMode::Subtle);
+    });
+    cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-enter", AcceptEditPrediction, None)]));
+
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.simulate_resize(size(px(800.), px(600.)));
+    let provider = cx.new(|_| FakeEditPredictionDelegate::default());
+    assign_editor_completion_provider(provider.clone(), &mut cx);
+    (cx, provider)
+}
+
+fn draw_editor(cx: &mut EditorTestContext) {
+    cx.cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    });
+}
+
+fn newest_cursor(cx: &mut EditorTestContext) -> Point {
+    cx.editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.selections.newest_anchor().head().to_point(&snapshot)
+    })
+}
+
+fn editor_scroll_position(cx: &mut EditorTestContext) -> gpui::Point<f64> {
+    cx.update_editor(|editor, _, cx| editor.scroll_position(cx))
+}
+
+fn left_edge_point(cx: &mut EditorTestContext) -> Point {
+    cx.editor(|editor, _, _| {
+        let position_map = editor
+            .last_position_map
+            .as_ref()
+            .expect("editor should have been drawn");
+        let column = position_map.line_layouts[0]
+            .index_for_x(position_map.scroll_pixel_position.x)
+            .expect("a visible left edge");
+        position_map.snapshot.display_point_to_point(
+            DisplayPoint::new(position_map.visible_row_range.start, column as u32),
+            Bias::Left,
+        )
+    })
+}
+
+fn assert_line_popover_within_text_bounds(cx: &mut EditorTestContext) {
+    let text_bounds = cx.editor(|editor, window, _| {
+        window.pixel_snap_bounds(
+            editor
+                .last_position_map
+                .as_ref()
+                .expect("editor should have been drawn")
+                .text_hitbox
+                .bounds,
+        )
+    });
+    let popover_bounds = cx
+        .cx
+        .debug_bounds("edit_prediction_line_popover")
+        .expect("edit prediction indicator should be drawn");
+    assert_eq!(
+        popover_bounds.intersect(&text_bounds),
+        popover_bounds,
+        "edit prediction indicator should be within the text bounds {text_bounds:?}"
+    );
 }

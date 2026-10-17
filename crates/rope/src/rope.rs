@@ -1299,6 +1299,121 @@ pub struct TextSummary {
     pub longest_row: u32,
     /// How many `char`s are in the longest row
     pub longest_row_chars: u32,
+    pub regional_indicators: RegionalIndicators,
+    pub word_runs: WordRuns,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct RegionalIndicators {
+    pub interrupted: bool,
+    pub odd: bool,
+}
+
+impl RegionalIndicators {
+    pub const INTERRUPTED: Self = Self {
+        interrupted: true,
+        odd: false,
+    };
+
+    #[inline(always)]
+    pub fn of(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        match bytes.last() {
+            None => return Self::default(),
+            Some(last) if !(0xA6..=0xBF).contains(last) => return Self::INTERRUPTED,
+            Some(_) => {}
+        }
+        let mut end = bytes.len();
+        let mut odd = false;
+        while end >= 4 && matches!(bytes[end - 4..end], [0xF0, 0x9F, 0x87, 0xA6..=0xBF]) {
+            end -= 4;
+            odd = !odd;
+        }
+        Self {
+            interrupted: end > 0,
+            odd,
+        }
+    }
+}
+
+impl<'a> ops::AddAssign<&'a Self> for RegionalIndicators {
+    #[inline(always)]
+    fn add_assign(&mut self, other: &'a Self) {
+        self.odd = (self.odd & !other.interrupted) ^ other.odd;
+        self.interrupted |= other.interrupted;
+    }
+}
+
+pub fn is_word_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct WordRuns {
+    pub leading: u32,
+    pub whole: bool,
+}
+
+impl Default for WordRuns {
+    fn default() -> Self {
+        Self {
+            leading: 0,
+            whole: true,
+        }
+    }
+}
+
+impl WordRuns {
+    pub const NON_WORD: Self = Self {
+        leading: 0,
+        whole: false,
+    };
+
+    #[inline(always)]
+    pub fn of(text: &str) -> Self {
+        let leading = Self::leading_run_len(text);
+        Self {
+            leading: leading as u32,
+            whole: leading == text.len(),
+        }
+    }
+
+    #[inline(always)]
+    fn is_word_byte(byte: u8) -> bool {
+        byte == b'_' || byte.is_ascii_alphanumeric()
+    }
+
+    #[inline(always)]
+    fn leading_run_len(text: &str) -> usize {
+        let bytes = text.as_bytes();
+        let mut end = 0;
+        while let Some(&byte) = bytes.get(end) {
+            if byte.is_ascii() {
+                if !Self::is_word_byte(byte) {
+                    break;
+                }
+                end += 1;
+            } else {
+                match text.get(end..).and_then(|rest| rest.chars().next()) {
+                    Some(character) if is_word_character(character) => {
+                        end += character.len_utf8();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        end
+    }
+}
+
+impl<'a> ops::AddAssign<&'a Self> for WordRuns {
+    #[inline(always)]
+    fn add_assign(&mut self, other: &'a Self) {
+        if self.whole {
+            self.leading = self.leading.saturating_add(other.leading);
+        }
+        self.whole = self.whole && other.whole;
+    }
 }
 
 impl TextSummary {
@@ -1320,6 +1435,8 @@ impl TextSummary {
             lines: Point::new(1, 0),
             longest_row: 0,
             longest_row_chars: 0,
+            regional_indicators: RegionalIndicators::INTERRUPTED,
+            word_runs: WordRuns::NON_WORD,
         }
     }
 
@@ -1329,6 +1446,8 @@ impl TextSummary {
         self.last_line_chars = 0;
         self.last_line_len_utf16 = 0;
         self.lines += Point::new(1, 0);
+        self.regional_indicators = RegionalIndicators::INTERRUPTED;
+        self.word_runs += &WordRuns::NON_WORD;
     }
 }
 
@@ -1376,6 +1495,8 @@ impl<'a> From<&'a str> for TextSummary {
             last_line_len_utf16,
             longest_row,
             longest_row_chars,
+            regional_indicators: RegionalIndicators::of(text),
+            word_runs: WordRuns::of(text),
         }
     }
 }
@@ -1427,6 +1548,8 @@ impl<'a> ops::AddAssign<&'a Self> for TextSummary {
         self.len += other.len;
         self.len_utf16 += other.len_utf16;
         self.lines += other.lines;
+        self.regional_indicators += &other.regional_indicators;
+        self.word_runs += &other.word_runs;
     }
 }
 
@@ -2528,6 +2651,66 @@ mod tests {
         assert_eq!(actual_summary.len, expected_summary.len);
         assert_eq!(actual_summary.lines, expected_summary.lines);
         assert_eq!(actual_summary.chars, expected_summary.chars);
+    }
+
+    #[test]
+    fn test_regional_indicators_across_chunks() {
+        let text = format!("a{}b{}", "\u{1f1fa}".repeat(37), "\u{1f1f8}".repeat(150));
+        let rope = Rope::from(text.as_str());
+        for end in (0..=text.len()).filter(|end| text.is_char_boundary(*end)) {
+            for start in [0, 1, 5].into_iter().filter(|start| *start <= end) {
+                let slice = &text[start..end];
+                let trailing = slice
+                    .chars()
+                    .rev()
+                    .take_while(|character| ('\u{1f1e6}'..='\u{1f1ff}').contains(character))
+                    .count();
+                assert_eq!(
+                    rope.cursor(start)
+                        .summary::<TextSummary>(end)
+                        .regional_indicators,
+                    RegionalIndicators {
+                        interrupted: trailing < slice.chars().count(),
+                        odd: trailing % 2 == 1,
+                    },
+                    "{start}..{end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_word_runs_across_chunks() {
+        let pieces = ["foo", "_", "bar9", "é", "漢字", "—", " ", "\n", ",", "x"];
+        let mut text = String::new();
+        for index in 0..240 {
+            text.push_str(pieces[(index * 7 + index / 3) % pieces.len()]);
+            if index % 120 == 0 {
+                text.push_str(&"a".repeat(200));
+                text.push_str(&"漢".repeat(50));
+            }
+        }
+        let rope = Rope::from(text.as_str());
+        let boundaries = (0..=text.len())
+            .filter(|offset| text.is_char_boundary(*offset))
+            .collect::<Vec<_>>();
+        for start in boundaries.iter().copied().step_by(29) {
+            for end in boundaries.iter().copied().filter(|end| *end >= start) {
+                let slice = &text[start..end];
+                assert_eq!(
+                    rope.cursor(start).summary::<TextSummary>(end).word_runs,
+                    WordRuns {
+                        leading: slice
+                            .chars()
+                            .take_while(|character| is_word_character(*character))
+                            .map(char::len_utf8)
+                            .sum::<usize>() as u32,
+                        whole: slice.chars().all(is_word_character),
+                    },
+                    "{start}..{end}"
+                );
+            }
+        }
     }
 
     fn clip_offset(text: &str, mut offset: usize, bias: Bias) -> usize {

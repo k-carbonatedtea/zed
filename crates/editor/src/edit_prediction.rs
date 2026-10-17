@@ -379,9 +379,12 @@ impl Editor {
                 let target = *target;
 
                 if matches!(granularity, EditPredictionGranularity::Full) {
-                    if let Some(position_map) = &self.last_position_map {
-                        let target_row = target.to_display_point(&position_map.snapshot).row();
-                        let is_visible = position_map.visible_row_range.contains(&target_row);
+                    if let Some(position_map) = self.last_position_map.clone() {
+                        let target_display_point = target.to_display_point(&position_map.snapshot);
+                        let is_visible = self.edit_prediction_target_placement_in_layout(
+                            target_display_point,
+                            &position_map,
+                        ) == EditPredictionTargetPlacement::Visible;
 
                         if is_visible || !self.edit_prediction_requires_modifier() {
                             self.unfold_ranges(&[target..target], true, false, cx);
@@ -398,10 +401,6 @@ impl Editor {
                                 .set_previous_scroll_position(None);
                         } else {
                             // Highlight and request scroll
-                            self.edit_prediction_preview
-                                .set_previous_scroll_position(Some(
-                                    position_map.snapshot.scroll_anchor,
-                                ));
                             self.highlight_rows::<EditPredictionPreview>(
                                 target..target,
                                 |cx| cx.theme().colors().editor_highlighted_line_background,
@@ -411,7 +410,15 @@ impl Editor {
                                 },
                                 cx,
                             );
-                            self.request_autoscroll(Autoscroll::fit(), cx);
+                            let previous_scroll_anchor = self.save_scroll_anchor(cx);
+                            self.scroll_to_edit_prediction_preview_target(
+                                target_display_point,
+                                &position_map,
+                                window,
+                                cx,
+                            );
+                            self.edit_prediction_preview
+                                .set_previous_scroll_position(Some(previous_scroll_anchor));
                         }
                     }
                 } else {
@@ -489,7 +496,6 @@ impl Editor {
                                     transaction_id_now,
                                     selections,
                                     self.add_selections_state.clone(),
-                                    self.selections.goal_origins(),
                                 );
                             }
                         }
@@ -791,15 +797,8 @@ impl Editor {
             since,
         } = self.edit_prediction_preview
         {
-            if let (Some(previous_scroll_position), Some(position_map)) =
-                (previous_scroll_position, self.last_position_map.as_ref())
-            {
-                self.set_scroll_position(
-                    previous_scroll_position
-                        .scroll_position(&position_map.snapshot.display_snapshot),
-                    window,
-                    cx,
-                );
+            if let Some(previous_scroll_position) = previous_scroll_position {
+                self.restore_scroll_anchor(previous_scroll_position, window, cx);
             }
 
             self.edit_prediction_preview = EditPredictionPreview::Inactive {
@@ -1127,6 +1126,7 @@ impl Editor {
                         scroll_pixel_position,
                         newest_selection_head,
                         target_display_point,
+                        editor_width,
                         window,
                         cx,
                     )
@@ -1709,32 +1709,62 @@ impl Editor {
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         newest_selection_head: Option<DisplayPoint>,
         target_display_point: DisplayPoint,
+        editor_width: Pixels,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
         const SCROLL_PADDING_Y: Pixels = px(12.);
 
-        if target_display_point.row() < visible_row_range.start {
+        let target_y = (target_display_point.row().as_f64() * f64::from(line_height))
+            - scroll_pixel_position.y;
+
+        let placement = edit_prediction_target_placement(
+            target_display_point,
+            &visible_row_range,
+            line_layouts,
+            scroll_pixel_position.x,
+            edit_prediction_visible_x(text_bounds, content_origin, editor_width),
+        );
+        let scroll_icon = match placement {
+            EditPredictionTargetPlacement::Above => Some(IconName::ArrowUp),
+            EditPredictionTargetPlacement::Below => Some(IconName::ArrowDown),
+            EditPredictionTargetPlacement::Left => Some(IconName::ArrowLeft),
+            EditPredictionTargetPlacement::Right => Some(IconName::ArrowRight),
+            EditPredictionTargetPlacement::Visible => None,
+        };
+        if let Some(scroll_icon) = scroll_icon {
+            let cursor_x = newest_selection_head
+                .filter(|cursor| visible_row_range.contains(&cursor.row()))
+                .and_then(|cursor| {
+                    line_layouts
+                        .get(cursor.row().minus(visible_row_range.start) as usize)
+                        .map(|line| line.x_for_index(cursor.column() as usize))
+                })
+                .map_or(Pixels::ZERO, |x| Pixels::from(x - scroll_pixel_position.x));
             return self.render_edit_prediction_scroll_popover(
-                &|_| SCROLL_PADDING_Y,
-                IconName::ArrowUp,
-                visible_row_range,
-                line_layouts,
-                newest_selection_head,
-                content_origin,
-                scroll_pixel_position,
-                window,
-                cx,
-            );
-        } else if target_display_point.row() >= visible_row_range.end {
-            return self.render_edit_prediction_scroll_popover(
-                &|size| text_bounds.size.height - size.height - SCROLL_PADDING_Y,
-                IconName::ArrowDown,
-                visible_row_range,
-                line_layouts,
-                newest_selection_head,
-                content_origin,
-                scroll_pixel_position,
+                |size| match placement {
+                    EditPredictionTargetPlacement::Above => {
+                        content_origin + point(cursor_x, SCROLL_PADDING_Y)
+                    }
+                    EditPredictionTargetPlacement::Below => {
+                        content_origin
+                            + point(
+                                cursor_x,
+                                text_bounds.size.height - size.height - SCROLL_PADDING_Y,
+                            )
+                    }
+                    _ => point(
+                        if placement == EditPredictionTargetPlacement::Left {
+                            content_origin.x
+                        } else {
+                            content_origin.x + editor_width - size.width - px(2.)
+                        },
+                        content_origin.y + Pixels::from(target_y)
+                            - (size.height - line_height) / 2.,
+                    ),
+                },
+                scroll_icon,
+                text_bounds,
                 window,
                 cx,
             );
@@ -1748,8 +1778,6 @@ impl Editor {
 
         let target_x =
             Pixels::from(line_layout.x_for_index(target_column) - scroll_pixel_position.x);
-        let target_y = (target_display_point.row().as_f64() * f64::from(line_height))
-            - scroll_pixel_position.y;
 
         let flag_on_right = target_x < text_bounds.size.width / 2.;
 
@@ -1796,13 +1824,9 @@ impl Editor {
 
     fn render_edit_prediction_scroll_popover(
         &mut self,
-        to_y: &dyn Fn(Size<Pixels>) -> Pixels,
+        to_origin: impl FnOnce(Size<Pixels>) -> gpui::Point<Pixels>,
         scroll_icon: IconName,
-        visible_row_range: Range<DisplayRow>,
-        line_layouts: &[LineWithInvisibles],
-        newest_selection_head: Option<DisplayPoint>,
-        content_origin: gpui::Point<Pixels>,
-        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+        text_bounds: &Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<(AnyElement, gpui::Point<Pixels>)> {
@@ -1811,19 +1835,81 @@ impl Editor {
             .into_any();
 
         let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
-
-        let cursor = newest_selection_head?;
-        let cursor_row_layout =
-            line_layouts.get(cursor.row().minus(visible_row_range.start) as usize)?;
-        let cursor_column = cursor.column() as usize;
-
-        let cursor_character_x =
-            Pixels::from(cursor_row_layout.x_for_index(cursor_column) - scroll_pixel_position.x);
-
-        let origin = content_origin + point(cursor_character_x, to_y(size));
+        let origin = to_origin(size);
+        let origin = point(
+            origin
+                .x
+                .min(text_bounds.right() - size.width)
+                .max(text_bounds.left()),
+            origin
+                .y
+                .min(text_bounds.bottom() - size.height)
+                .max(text_bounds.top()),
+        );
 
         element.prepaint_at(origin, window, cx);
         Some((element, origin))
+    }
+
+    fn edit_prediction_target_placement_in_layout(
+        &self,
+        target: DisplayPoint,
+        position_map: &PositionMap,
+    ) -> EditPredictionTargetPlacement {
+        edit_prediction_target_placement(
+            target,
+            &position_map.visible_row_range,
+            &position_map.line_layouts,
+            position_map.scroll_pixel_position.x,
+            edit_prediction_visible_x(
+                &position_map.text_hitbox.bounds,
+                position_map.content_origin,
+                self.edit_prediction_viewport_width(position_map),
+            ),
+        )
+    }
+
+    fn edit_prediction_viewport_width(&self, position_map: &PositionMap) -> Pixels {
+        self.visible_column_count().map_or_else(
+            || position_map.text_hitbox.bounds.right() - position_map.content_origin.x,
+            |columns| position_map.em_advance * columns as f32,
+        )
+    }
+
+    fn scroll_to_edit_prediction_preview_target(
+        &mut self,
+        target: DisplayPoint,
+        position_map: &PositionMap,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let expect_bounds_change = self.expect_bounds_change.take();
+        self.autoscroll_vertically(
+            position_map.text_hitbox.bounds,
+            position_map.line_height,
+            position_map.scroll_max.y,
+            Some((Autoscroll::fit(), true)),
+            window,
+            cx,
+        );
+        self.expect_bounds_change = expect_bounds_change;
+
+        let viewport_width =
+            ScrollPixelOffset::from(self.edit_prediction_viewport_width(position_map));
+        let em_layout_width = ScrollPixelOffset::from(position_map.em_layout_width);
+        let text_layout_details = self.text_layout_details(window, cx);
+        let target_x = self
+            .display_snapshot(cx)
+            .x_for_display_point(target, &text_layout_details);
+        let scroll_left = if target_x + em_layout_width <= viewport_width {
+            0.
+        } else {
+            target_x - viewport_width / 2.
+        };
+
+        let mut scroll_position = self.scroll_position(cx);
+        scroll_position.x = scroll_left / em_layout_width;
+        self.set_scroll_position_internal(scroll_position, true, true, window, cx);
     }
 
     fn render_edit_prediction_eager_jump_popover(
@@ -2248,6 +2334,7 @@ impl Editor {
 
         h_flex()
             .id("ep-line-popover")
+            .debug_selector(|| "edit_prediction_line_popover".into())
             .py_0p5()
             .pl_1()
             .pr(padding_right)
@@ -2610,4 +2697,49 @@ fn all_edits_insertions_or_deletions(
         }
     }
     all_insertions || all_deletions
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditPredictionTargetPlacement {
+    Visible,
+    Above,
+    Below,
+    Left,
+    Right,
+}
+
+fn edit_prediction_target_placement(
+    target: DisplayPoint,
+    visible_row_range: &Range<DisplayRow>,
+    line_layouts: &[LineWithInvisibles],
+    scroll_pixel_x: ScrollPixelOffset,
+    visible_x: Range<ScrollPixelOffset>,
+) -> EditPredictionTargetPlacement {
+    if target.row() < visible_row_range.start {
+        return EditPredictionTargetPlacement::Above;
+    }
+    if target.row() >= visible_row_range.end {
+        return EditPredictionTargetPlacement::Below;
+    }
+    let Some(line_layout) = line_layouts.get(target.row().minus(visible_row_range.start) as usize)
+    else {
+        return EditPredictionTargetPlacement::Visible;
+    };
+    let target_x = line_layout.x_for_index(target.column() as usize) - scroll_pixel_x;
+    if target_x < visible_x.start {
+        EditPredictionTargetPlacement::Left
+    } else if target_x > visible_x.end {
+        EditPredictionTargetPlacement::Right
+    } else {
+        EditPredictionTargetPlacement::Visible
+    }
+}
+
+fn edit_prediction_visible_x(
+    text_bounds: &Bounds<Pixels>,
+    content_origin: gpui::Point<Pixels>,
+    viewport_width: Pixels,
+) -> Range<ScrollPixelOffset> {
+    ScrollPixelOffset::from(text_bounds.left() - content_origin.x)
+        ..ScrollPixelOffset::from(viewport_width)
 }

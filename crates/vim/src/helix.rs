@@ -16,7 +16,7 @@ use language::{CharClassifier, CharKind, Point, Selection};
 use multi_buffer::MultiBufferSnapshot;
 use search::{BufferSearchBar, SearchOptions};
 use settings::Settings;
-use text::{Bias, LineEnding, SelectionGoal};
+use text::{Bias, LineEnding, SelectionGoal, is_word_character};
 use theme::ActiveTheme as _;
 use ui::px;
 use workspace::searchable::{self, Direction, FilteredSearchRange};
@@ -1374,7 +1374,7 @@ impl Vim {
         let starts_mid_word = buffer
             .reversed_chars_at(start_offset)
             .next()
-            .is_some_and(is_jump_word_char);
+            .is_some_and(is_word_character);
         let mut offset = start_offset;
         let mut in_word = false;
         let mut partial_word = false;
@@ -1385,7 +1385,7 @@ impl Vim {
         for chunk in buffer.text_for_range(start_offset..end_offset) {
             for (idx, ch) in chunk.char_indices() {
                 let absolute = offset + idx;
-                let is_word = is_jump_word_char(ch);
+                let is_word = is_word_character(ch);
                 if is_word {
                     if !in_word {
                         in_word = true;
@@ -1423,13 +1423,15 @@ impl Vim {
                 && let Some(next) = buffer
                     .chars_at(end_offset)
                     .next()
-                    .filter(|next| is_jump_word_char(*next))
+                    .filter(|next| is_word_character(*next))
             {
                 first_two_end = end_offset + next.len_utf8();
                 char_count += 1;
             }
             let word_end = end_offset.max(first_two_end);
-            if char_count >= 2 && !Self::should_skip_jump_candidate(word_start, word_end, skip_data)
+            if char_count >= 2
+                && !Self::should_skip_jump_candidate(word_start, word_end, skip_data)
+                && !Self::word_continues_into_skip(buffer, word_end, skip_data)
             {
                 candidates.push(JumpCandidate {
                     word_start,
@@ -1443,17 +1445,43 @@ impl Vim {
         candidates
     }
 
+    fn word_continues_into_skip(
+        buffer: &MultiBufferSnapshot,
+        visible_end: MultiBufferOffset,
+        skip_data: &HelixJumpSkipData,
+    ) -> bool {
+        let next_point = skip_data
+            .points
+            .get(
+                skip_data
+                    .points
+                    .partition_point(|offset| *offset < visible_end),
+            )
+            .copied();
+        let next_range = skip_data
+            .ranges
+            .get(
+                skip_data
+                    .ranges
+                    .partition_point(|range| range.end <= visible_end),
+            )
+            .map(|range| range.start.max(visible_end));
+        let Some(skip) = next_point.into_iter().chain(next_range).min() else {
+            return false;
+        };
+        let Some(skipped_character) = buffer.chars_at(skip).next() else {
+            return false;
+        };
+        buffer.word_run_end(visible_end) >= skip + skipped_character.len_utf8()
+    }
+
     pub(crate) fn jump_target_word_end(buffer: &MultiBufferSnapshot, end: Anchor) -> Anchor {
         let offset = end.to_offset(buffer);
-        let continuation = buffer
-            .chars_at(offset)
-            .take_while(|ch| is_jump_word_char(*ch))
-            .map(char::len_utf8)
-            .sum::<usize>();
-        if continuation == 0 {
+        let word_end = buffer.word_run_end(offset);
+        if word_end == offset {
             end
         } else {
-            buffer.anchor_after(offset + continuation)
+            buffer.anchor_after(word_end)
         }
     }
 
@@ -1761,7 +1789,7 @@ impl Vim {
 
         if ws_count > 0 {
             let next_is_word = match next_non_ws {
-                Some(ch) => is_jump_word_char(ch),
+                Some(ch) => is_word_character(ch),
                 None => false,
             };
 
@@ -1794,10 +1822,6 @@ const HELIX_JUMP_MONOSPACE_TOLERANCE: Pixels = px(0.5);
 const HELIX_JUMP_MIN_LABEL_SCALE: f32 = 1.0;
 const HELIX_JUMP_MAX_HIDDEN_CHARS: usize = 16;
 const HELIX_JUMP_MAX_LEFT_WS_CHARS: usize = 32;
-
-fn is_jump_word_char(ch: char) -> bool {
-    ch == '_' || ch.is_alphanumeric()
-}
 
 /// A word candidate for jump labels, before label assignment.
 #[derive(Clone)]
@@ -1882,7 +1906,7 @@ impl HiddenPrefixFitState {
                 self.text.push(ch);
                 let end_offset = absolute + ch.len_utf8();
 
-                if absolute < word_end && is_jump_word_char(ch) {
+                if absolute < word_end && is_word_character(ch) {
                     self.word_char_count += 1;
                 }
 
@@ -1918,7 +1942,7 @@ struct HelixJumpUiData {
 #[cfg(test)]
 mod test {
     use futures::StreamExt;
-    use std::{fmt::Write, time::Duration};
+    use std::{fmt::Write, ops::Range, time::Duration};
 
     use editor::{HighlightKey, MultiBufferOffset, ToOffset};
     use gpui::{
@@ -4840,25 +4864,65 @@ mod test {
 
     #[gpui::test]
     fn test_helix_jump_candidates_stay_within_range_edges(cx: &mut gpui::App) {
+        let candidate_words =
+            |text: &str, range: Range<usize>, skipped_point: Option<usize>, cx: &mut gpui::App| {
+                let buffer = MultiBuffer::build_simple(text, cx).read(cx).snapshot(cx);
+                Vim::collect_jump_candidates(
+                    &buffer,
+                    MultiBufferOffset(range.start),
+                    MultiBufferOffset(range.end),
+                    &HelixJumpSkipData {
+                        points: skipped_point.map(MultiBufferOffset).into_iter().collect(),
+                        ranges: Vec::new(),
+                    },
+                )
+                .iter()
+                .map(|candidate| candidate.word_start.0..candidate.word_end.0)
+                .collect::<Vec<_>>()
+            };
+        assert_eq!(
+            [
+                candidate_words("foobar baz qux", 3..12, None, cx),
+                candidate_words("left aaaaaaaaaa right", 0..8, Some(6), cx),
+                candidate_words("left aaaaaaaaaa right", 0..8, Some(12), cx),
+                candidate_words("left aaaaaaaaaa right", 0..8, Some(15), cx),
+                candidate_words("left aaaaaaaaaa right", 0..8, Some(20), cx),
+                candidate_words("left aaaaaaaaaa\nright", 0..8, Some(17), cx),
+                candidate_words(
+                    &format!("left {} right", "é".repeat(40)),
+                    0..9,
+                    Some(65),
+                    cx
+                ),
+                candidate_words(
+                    &format!("left {} right", "a".repeat(70_000)),
+                    0..80,
+                    Some(66_000),
+                    cx
+                ),
+                candidate_words(
+                    &format!("left {} right", "a".repeat(3 * 1024 * 1024)),
+                    0..80,
+                    Some(3 * 1024 * 1024),
+                    cx
+                ),
+            ],
+            [
+                vec![7..10, 11..13],
+                vec![0..4],
+                vec![0..4],
+                vec![0..4, 5..8],
+                vec![0..4, 5..8],
+                vec![0..4, 5..8],
+                vec![0..4],
+                vec![0..4],
+                vec![0..4],
+            ]
+        );
+
         let buffer = MultiBuffer::build_simple("foobar baz qux", cx)
             .read(cx)
             .snapshot(cx);
-        let candidates = Vim::collect_jump_candidates(
-            &buffer,
-            MultiBufferOffset(3),
-            MultiBufferOffset(12),
-            &HelixJumpSkipData {
-                points: Vec::new(),
-                ranges: Vec::new(),
-            },
-        );
-        assert_eq!(
-            candidates
-                .iter()
-                .map(|candidate| candidate.word_start.0..candidate.word_end.0)
-                .collect::<Vec<_>>(),
-            [7..10, 11..13]
-        );
         let word_end = |offset| {
             Vim::jump_target_word_end(&buffer, buffer.anchor_after(MultiBufferOffset(offset)))
                 .to_offset(&buffer)

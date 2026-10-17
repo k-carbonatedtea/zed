@@ -1918,17 +1918,21 @@ impl Vim {
                 });
             }
             HelixJumpBehaviour::Extend => {
-                let buffer = editor.buffer().read(cx).snapshot(cx);
-                let word_end = Vim::jump_target_word_end(&buffer, candidate.range.end);
+                let mut word_end = None;
                 editor.change_selections(Default::default(), window, cx, |s| {
                     s.move_with(&mut |map, selection| {
                         let word_start = candidate.range.start.to_display_point(map);
-                        let word_end = word_end.to_display_point(map);
                         let tail = selection.tail();
 
                         if word_start >= tail {
                             // Jumping forward: extend head to end of target word
-                            selection.set_head(word_end, SelectionGoal::None);
+                            let word_end = *word_end.get_or_insert_with(|| {
+                                Vim::jump_target_word_end(
+                                    map.buffer_snapshot(),
+                                    candidate.range.end,
+                                )
+                            });
+                            selection.set_head(word_end.to_display_point(map), SelectionGoal::None);
                         } else {
                             // Jumping backward: extend backward while keeping current extent
                             // Use current end as tail to preserve the selection

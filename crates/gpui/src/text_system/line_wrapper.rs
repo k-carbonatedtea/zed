@@ -575,6 +575,17 @@ impl LineWrapper {
             .platform_text_system
             .layout_line(text, self.font_size, runs)
     }
+
+    /// Returns the layout, flattened glyph x positions, and width, with platform-dependent precision.
+    pub fn layout_line_with_precise_positions(
+        &self,
+        text: &str,
+        runs: &[FontRun],
+    ) -> (LineLayout, Vec<f64>, f64) {
+        self.text_system
+            .platform_text_system
+            .layout_line_with_precise_positions(text, self.font_size, runs)
+    }
 }
 
 fn update_runs_after_truncation(
@@ -751,7 +762,10 @@ impl Boundary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
+    use crate::{
+        Font, FontFeatures, FontStyle, FontWeight, NoopTextSystem, TestAppContext, TestDispatcher,
+        font,
+    };
     #[cfg(target_os = "macos")]
     use crate::{TextRun, WindowTextSystem, WrapBoundary};
 
@@ -777,6 +791,31 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_layout_line_with_precise_positions_default() {
+        let wrapper = LineWrapper::new(
+            FontId(0),
+            px(10.),
+            Arc::new(TextSystem::new(Arc::new(NoopTextSystem))),
+        );
+        for (text, expected_positions, expected_width) in [
+            ("", &[][..], 0.),
+            ("a😀e\u{301}", &[0., 6., 18., 24.][..], 30.),
+        ] {
+            let (layout, positions, width) = wrapper.layout_line_with_precise_positions(
+                text,
+                &[FontRun {
+                    font_id: wrapper.font_id(),
+                    len: text.len(),
+                }],
+            );
+            assert_eq!(layout.len, text.len());
+            assert_eq!(positions, expected_positions);
+            assert_eq!(width, expected_width);
+            assert_eq!(f64::from(f32::from(layout.width)), width);
+        }
     }
 
     #[test]

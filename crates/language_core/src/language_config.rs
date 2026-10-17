@@ -11,8 +11,10 @@ use std::{num::NonZeroU32, path::Path, sync::Arc};
 #[serde(rename_all = "snake_case")]
 pub enum SoftWrap {
     /// Do not soft-wrap.
-    #[serde(alias = "prefer_line")]
     None,
+    /// Deprecated: use None instead. Left to avoid breaking existing users' configs.
+    /// Prefer a single line generally, unless an overly long line is encountered.
+    PreferLine,
     /// Soft wrap lines that exceed the editor width.
     EditorWidth,
     /// Soft wrap line at the preferred line length or the editor width (whichever is smaller).
@@ -525,16 +527,4 @@ pub fn regex_vec_json_schema(_: &mut SchemaGenerator) -> schemars::Schema {
         "type": "array",
         "items": { "type": "string" }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_soft_wrap_toml_accepts_legacy_prefer_line() {
-        let config =
-            LanguageConfig::from_toml("name = \"Test\"\nsoft_wrap = \"prefer_line\"").unwrap();
-        assert_eq!(config.soft_wrap, Some(SoftWrap::None));
-    }
 }

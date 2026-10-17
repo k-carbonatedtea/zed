@@ -39,7 +39,7 @@ use crate::{
 };
 
 pub(crate) struct StickyHeader {
-    sticky_row: DisplayRow,
+    pub(crate) sticky_row: DisplayRow,
     pub(crate) start_point: Point,
     pub(crate) offset: ScrollOffset,
 }
@@ -225,11 +225,37 @@ impl EditorElement {
         header
     }
 
-    pub(super) fn layout_sticky_headers(
+    pub(super) fn layout_sticky_header_lines(
         &self,
         snapshot: &EditorSnapshot,
         editor_width: Pixels,
         is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
+        scroll_x: ScrollPixelOffset,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<(StickyHeader, LineWithInvisibles)> {
+        Self::sticky_headers(self.editor.read(cx), snapshot)
+            .into_iter()
+            .map(|header| {
+                let line = layout_line(
+                    header.sticky_row,
+                    snapshot,
+                    &self.style,
+                    editor_width,
+                    scroll_x,
+                    is_row_soft_wrapped,
+                    window,
+                    cx,
+                );
+                (header, line)
+            })
+            .collect()
+    }
+
+    pub(super) fn layout_sticky_headers(
+        &self,
+        header_lines: Vec<(StickyHeader, LineWithInvisibles)>,
+        snapshot: &EditorSnapshot,
         line_height: Pixels,
         scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
         content_origin: gpui::Point<Pixels>,
@@ -245,27 +271,17 @@ impl EditorElement {
             .show_line_numbers
             .unwrap_or_else(|| EditorSettings::get_global(cx).gutter.line_numbers);
 
-        let rows = Self::sticky_headers(self.editor.read(cx), snapshot);
-
         let mut lines = Vec::<StickyHeaderLine>::new();
 
-        for StickyHeader {
-            sticky_row,
-            start_point,
-            offset,
-        } in rows.into_iter().rev()
-        {
-            let mut line = layout_line(
+        for (
+            StickyHeader {
                 sticky_row,
-                snapshot,
-                &self.style,
-                editor_width,
-                scroll_pixel_position.x,
-                is_row_soft_wrapped,
-                window,
-                cx,
-            );
-
+                start_point,
+                offset,
+            },
+            mut line,
+        ) in header_lines.into_iter().rev()
+        {
             let line_number = show_line_numbers.then(|| {
                 let start_display_row = start_point.to_display_point(snapshot).row();
                 let relative_number = relative_to

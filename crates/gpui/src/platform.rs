@@ -1519,6 +1519,22 @@ pub trait PlatformTextSystem: Send + Sync {
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     /// Layout a line of text with the given font runs.
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+    fn layout_line_with_precise_positions(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+    ) -> (LineLayout, Vec<f64>, f64) {
+        let layout = self.layout_line(text, font_size, runs);
+        let glyph_x_positions = layout
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .map(|glyph| f64::from(f32::from(glyph.position.x)))
+            .collect::<Vec<_>>();
+        let width = f64::from(f32::from(layout.width));
+        (layout, glyph_x_positions, width)
+    }
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;

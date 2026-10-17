@@ -4,7 +4,9 @@
 use super::{Bias, DisplayPoint, DisplaySnapshot, SelectionGoal, ToDisplayPoint};
 use crate::{
     DisplayRow, EditorStyle, ToOffset, ToPoint,
+    display_map::SyntaxStyling,
     scroll::{ScrollOffset, SharedScrollAnchor},
+    selections_collection::HorizontalOrigins,
 };
 use gpui::{Pixels, WindowTextSystem};
 use language::{CharClassifier, Point};
@@ -25,13 +27,25 @@ pub enum FindRange {
 
 /// TextLayoutDetails encompasses everything we need to move vertically
 /// taking into account variable width characters.
+#[derive(Clone)]
 pub struct TextLayoutDetails {
     pub(crate) text_system: Arc<WindowTextSystem>,
     pub(crate) editor_style: EditorStyle,
     pub(crate) rem_size: Pixels,
+    pub(crate) syntax: SyntaxStyling,
+    pub(crate) horizontal_origins: HorizontalOrigins,
     pub scroll_anchor: SharedScrollAnchor,
     pub visible_rows: Option<f64>,
     pub vertical_scroll_margin: ScrollOffset,
+}
+
+impl TextLayoutDetails {
+    pub(crate) fn detached(&self) -> Self {
+        Self {
+            horizontal_origins: HorizontalOrigins::default(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Returns a column to the left of the current point, wrapping

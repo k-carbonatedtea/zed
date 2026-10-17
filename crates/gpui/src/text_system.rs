@@ -647,33 +647,8 @@ impl WindowTextSystem {
             "text argument should not contain newlines"
         );
 
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
-        for run in runs {
-            if let Some(last_run) = decoration_runs.last_mut()
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-                && last_run.background_color == run.background_color
-            {
-                last_run.len += run.len as u32;
-                continue;
-            }
-            decoration_runs.push(DecorationRun {
-                len: run.len as u32,
-                color: run.color,
-                background_color: run.background_color,
-                underline: run.underline,
-                strikethrough: run.strikethrough,
-            });
-        }
-
         let layout = self.layout_line(&text, font_size, runs, force_width);
-
-        ShapedLine {
-            layout,
-            text,
-            decoration_runs,
-        }
+        ShapedLine::new(layout, text, runs)
     }
 
     /// Shape the given line using a caller-provided content hash as the cache key.
