@@ -31,6 +31,7 @@
 
 use crate::{
     command::RemoteCommand,
+    proxy::ProxyLaunchError,
     remote_client::{
         ChannelClient, CommandTemplate, Interactive, RemoteClientDelegate, RemoteConnection,
         RemoteConnectionOptions,
@@ -38,7 +39,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use futures::{
     FutureExt, SinkExt, StreamExt,
     channel::{
@@ -52,8 +53,8 @@ use rpc::{AnyProtoClient, proto::Envelope};
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use util::paths::{PathStyle, RemotePathBuf};
@@ -66,9 +67,6 @@ pub struct MockConnectionOptions {
 
 /// A mock implementation of `RemoteConnection` for testing.
 pub struct MockRemoteConnection {
-    options: MockConnectionOptions,
-    server_channel: Arc<ChannelClient>,
-    server_cx: SendableCx,
     pub(crate) proxy_tx: parking_lot::Mutex<
         Option<
             mpsc::UnboundedSender<(
@@ -77,6 +75,10 @@ pub struct MockRemoteConnection {
             )>,
         >,
     >,
+    options: MockConnectionOptions,
+    server_channel: Arc<ChannelClient>,
+    server_cx: SendableCx,
+    killed: AtomicBool,
 }
 
 /// Wrapper to pass `AsyncApp` across thread boundaries in tests.
@@ -110,6 +112,8 @@ unsafe impl Sync for SendableCx {}
 #[derive(Default)]
 pub struct MockConnectionRegistry {
     pending: HashMap<u64, (oneshot::Receiver<()>, Arc<MockRemoteConnection>)>,
+    delivered: HashMap<u64, Weak<MockRemoteConnection>>,
+    pub(crate) identifiers_owned_by_another_client: HashSet<String>,
 }
 
 impl Global for MockConnectionRegistry {}
@@ -120,10 +124,19 @@ impl MockConnectionRegistry {
         &mut self,
         opts: &MockConnectionOptions,
     ) -> Option<impl Future<Output = Arc<MockRemoteConnection>> + use<>> {
-        let (guard, con) = self.pending.remove(&opts.id)?;
+        let (guard, connection) = match self.pending.remove(&opts.id) {
+            Some((guard, connection)) => (Some(guard), connection),
+            None => {
+                let previous = self.delivered.get(&opts.id)?.upgrade()?;
+                (None, Arc::new(previous.replacement()))
+            }
+        };
+        self.delivered.insert(opts.id, Arc::downgrade(&connection));
         Some(async move {
-            _ = guard.await;
-            con
+            if let Some(guard) = guard {
+                guard.await.ok();
+            }
+            connection
         })
     }
 }
@@ -180,7 +193,8 @@ impl MockConnection {
             options: opts.clone(),
             server_channel: server_client.clone(),
             server_cx: SendableCx::new(server_cx),
-            proxy_tx: Default::default(),
+            killed: AtomicBool::new(false),
+            proxy_tx: parking_lot::Mutex::default(),
         });
 
         let (tx, rx) = oneshot::channel();
@@ -195,14 +209,27 @@ impl MockConnection {
     }
 }
 
+impl MockRemoteConnection {
+    fn replacement(&self) -> Self {
+        Self {
+            options: self.options.clone(),
+            server_channel: self.server_channel.clone(),
+            server_cx: SendableCx(self.server_cx.0.clone()),
+            killed: AtomicBool::new(false),
+            proxy_tx: parking_lot::Mutex::new(self.proxy_tx.lock().clone()),
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl RemoteConnection for MockRemoteConnection {
     async fn kill(&self) -> Result<()> {
+        self.killed.store(true, Ordering::Release);
         Ok(())
     }
 
     fn has_been_killed(&self) -> bool {
-        false
+        self.killed.load(Ordering::Acquire)
     }
 
     fn build_command(
@@ -268,7 +295,7 @@ impl RemoteConnection for MockRemoteConnection {
 
     fn start_proxy(
         &self,
-        _unique_identifier: String,
+        unique_identifier: String,
         _reconnect: bool,
         mut client_incoming_tx: mpsc::UnboundedSender<Envelope>,
         mut client_outgoing_rx: mpsc::UnboundedReceiver<Envelope>,
@@ -276,6 +303,19 @@ impl RemoteConnection for MockRemoteConnection {
         _delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>> {
+        let owned_by_another_client = cx.update(|cx| {
+            cx.try_global::<MockConnectionRegistry>()
+                .is_some_and(|registry| {
+                    registry
+                        .identifiers_owned_by_another_client
+                        .contains(&unique_identifier)
+                })
+        });
+        if owned_by_another_client {
+            return Task::ready(Ok(
+                ProxyLaunchError::ServerOwnedByAnotherClient.to_exit_code()
+            ));
+        }
         if let Some(proxy_tx) = self.proxy_tx.lock().as_ref() {
             proxy_tx
                 .unbounded_send((client_incoming_tx, client_outgoing_rx))

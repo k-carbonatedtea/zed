@@ -627,7 +627,7 @@ impl SerializableItem for ProjectDiff {
 
     fn serialize(
         &mut self,
-        _: &mut Workspace,
+        _: Option<workspace::WorkspaceId>,
         _: workspace::ItemId,
         _: bool,
         _: &mut Context<Self>,

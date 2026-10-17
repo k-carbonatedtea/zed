@@ -1,18 +1,20 @@
 use std::{path::PathBuf, sync::Arc};
 
-use parking_lot::Mutex;
-
 use anyhow::Result;
 use askpass::EncryptedPassword;
 use auto_update::AutoUpdater;
-use futures::{FutureExt as _, channel::oneshot, select};
+use futures::{FutureExt as _, channel::oneshot, select, select_biased};
 use gpui::{
     AnyWindowHandle, App, AsyncApp, DismissEvent, Entity, EventEmitter, Focusable, FontFeatures,
     ParentElement as _, Render, SharedString, Task, TextStyleRefinement, WeakEntity,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
+use parking_lot::Mutex;
 use release_channel::ReleaseChannel;
-use remote::{ConnectionIdentifier, RemoteClient, RemoteConnectionOptions, RemotePlatform};
+use remote::{
+    ConnectionIdentifier, RemoteClient, RemoteConnectionOptions, RemoteConnectionTarget,
+    RemotePlatform,
+};
 use semver::Version;
 use settings::Settings;
 use theme_settings::ThemeSettings;
@@ -32,9 +34,16 @@ pub struct RemoteConnectionPrompt {
     prompt: Option<(Entity<Markdown>, oneshot::Sender<EncryptedPassword>)>,
     prompt_cancellation_task: Option<Task<()>>,
     cancellation: Option<oneshot::Sender<()>>,
+    failure: Option<ConnectionFailure>,
     editor: Arc<dyn ErasedEditor>,
     is_password_prompt: bool,
     is_masked: bool,
+}
+
+struct ConnectionFailure {
+    title: SharedString,
+    message: SharedString,
+    retry: oneshot::Sender<bool>,
 }
 
 impl Drop for RemoteConnectionPrompt {
@@ -74,6 +83,7 @@ impl RemoteConnectionPrompt {
             editor,
             status_message: None,
             cancellation: None,
+            failure: None,
             prompt: None,
             prompt_cancellation_task: None,
             is_password_prompt: false,
@@ -85,10 +95,11 @@ impl RemoteConnectionPrompt {
         self.cancellation = Some(tx);
     }
 
-    pub fn cancel(&mut self) {
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = self.cancellation.take() {
             cancel.send(()).ok();
         }
+        self.respond_to_failure(false, cx);
     }
 
     pub fn set_prompt(
@@ -102,14 +113,16 @@ impl RemoteConnectionPrompt {
         let is_yes_no = is_confirmation_prompt(&prompt);
         self.is_password_prompt = !is_yes_no;
         self.is_masked = !is_yes_no;
+        self.editor.clear(window, cx);
         self.editor.set_masked(self.is_masked, window, cx);
 
         let markdown = cx.new(|cx| Markdown::new_text(prompt.into(), cx));
         self.prompt = Some((markdown, tx));
-        self.prompt_cancellation_task = Some(cx.spawn(async move |this, cx| {
+        self.prompt_cancellation_task = Some(cx.spawn_in(window, async move |this, cx| {
             cancellation.await.ok();
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.prompt.take();
+                this.editor.clear(window, cx);
                 cx.notify();
             })
             .ok();
@@ -119,12 +132,18 @@ impl RemoteConnectionPrompt {
         cx.notify();
     }
 
-    fn prompt_answered(&mut self, cx: &mut Context<Self>) {
-        if self.prompt.take().is_some() {
-            self.prompt_cancellation_task.take();
-            self.status_message = Some("Connecting".into());
-            cx.notify();
-        }
+    fn finish_prompt(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, oneshot::Sender<EncryptedPassword>)> {
+        let (_, tx) = self.prompt.take()?;
+        self.prompt_cancellation_task.take();
+        self.status_message = Some("Connecting".into());
+        let text = self.editor.text(cx);
+        self.editor.clear(window, cx);
+        cx.notify();
+        Some((text, tx))
     }
 
     pub fn set_status(&mut self, status: Option<String>, cx: &mut Context<Self>) {
@@ -132,16 +151,41 @@ impl RemoteConnectionPrompt {
         cx.notify();
     }
 
-    pub fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((_, tx)) = self.prompt.take() {
-            self.prompt_cancellation_task.take();
-            self.status_message = Some("Connecting".into());
+    pub fn show_failure(
+        &mut self,
+        title: SharedString,
+        message: SharedString,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<bool> {
+        let (retry, response) = oneshot::channel();
+        self.prompt.take();
+        self.prompt_cancellation_task.take();
+        self.status_message.take();
+        self.failure = Some(ConnectionFailure {
+            title,
+            message,
+            retry,
+        });
+        cx.notify();
+        response
+    }
 
-            let pw = self.editor.text(cx);
-            if let Ok(secure) = EncryptedPassword::try_from(pw.as_ref()) {
-                tx.send(secure).ok();
-            }
-            self.editor.clear(window, cx);
+    pub fn has_failure(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    pub fn respond_to_failure(&mut self, retry: bool, cx: &mut Context<Self>) {
+        if let Some(failure) = self.failure.take() {
+            failure.retry.send(retry).ok();
+            cx.notify();
+        }
+    }
+
+    pub fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((pw, tx)) = self.finish_prompt(window, cx)
+            && let Ok(secure) = EncryptedPassword::try_from(pw.as_ref())
+        {
+            tx.send(secure).ok();
         }
     }
 }
@@ -179,6 +223,27 @@ impl Render for RemoteConnectionPrompt {
             .key_context("PasswordPrompt")
             .p_2()
             .size_full()
+            .when_some(self.failure.as_ref(), |this, failure| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::XCircle)
+                                        .size(IconSize::Small)
+                                        .color(Color::Error),
+                                )
+                                .child(Label::new(failure.title.clone())),
+                        )
+                        .child(
+                            Label::new(failure.message.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .when_some(self.prompt.as_ref(), |this, prompt| {
                 this.child(
                     v_flex()
@@ -291,8 +356,12 @@ impl RemoteConnectionModal {
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        self.prompt
-            .update(cx, |prompt, cx| prompt.confirm(window, cx))
+        if self.prompt.read(cx).has_failure() {
+            self.retry(cx);
+        } else {
+            self.prompt
+                .update(cx, |prompt, cx| prompt.confirm(window, cx))
+        }
     }
 
     pub fn finished(&mut self, cx: &mut Context<Self>) {
@@ -301,14 +370,14 @@ impl RemoteConnectionModal {
     }
 
     fn dismiss(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tx) = self
-            .prompt
-            .update(cx, |prompt, _cx| prompt.cancellation.take())
-        {
-            log::debug!("cancelling remote connection");
-            tx.send(()).ok();
-        }
+        log::debug!("cancelling remote connection");
+        self.prompt.update(cx, |prompt, cx| prompt.cancel(cx));
         self.finished(cx);
+    }
+
+    fn retry(&mut self, cx: &mut Context<Self>) {
+        self.prompt
+            .update(cx, |prompt, cx| prompt.respond_to_failure(true, cx));
     }
 }
 
@@ -382,6 +451,7 @@ impl Render for RemoteConnectionModal {
         let connection_string = self.prompt.read(cx).connection_string.clone();
         let is_wsl = self.prompt.read(cx).is_wsl;
         let is_devcontainer = self.prompt.read(cx).is_devcontainer;
+        let has_failure = self.prompt.read(cx).has_failure();
 
         let theme = cx.theme().clone();
         let body_color = theme.colors().editor_background;
@@ -413,6 +483,26 @@ impl Render for RemoteConnectionModal {
                     .border_color(theme.colors().border_variant)
                     .child(self.prompt.clone()),
             )
+            .when(has_failure, |this| {
+                this.child(
+                    div().w_full().pt_1().child(
+                        ListItem::new("li-remote-connection-retry")
+                            .inset(true)
+                            .spacing(ui::ListItemSpacing::Sparse)
+                            .start_slot(Icon::new(IconName::RotateCw).color(Color::Muted))
+                            .child(Label::new("Retry"))
+                            .end_slot(
+                                KeyBinding::for_action_in(
+                                    &menu::Confirm,
+                                    &self.focus_handle(cx),
+                                    cx,
+                                )
+                                .size(rems_from_px(12_f32)),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.retry(cx))),
+                    ),
+                )
+            })
             .child(
                 div().w_full().py_1().child(
                     ListItem::new("li-devcontainer-go-back")
@@ -455,17 +545,24 @@ impl ModalView for RemoteConnectionModal {
 }
 
 #[derive(Clone, Default)]
-pub struct KnownPassword(Arc<Mutex<KnownPasswordState>>);
+pub struct KnownPassword {
+    connection: Option<RemoteConnectionTarget>,
+    state: Arc<Mutex<KnownPasswordState>>,
+}
 
 impl KnownPassword {
     pub fn for_connection(connection_options: &RemoteConnectionOptions) -> Self {
-        let known_password = Self::default();
+        let known_password = Self {
+            connection: Some(RemoteConnectionTarget::from(connection_options)),
+            state: Arc::default(),
+        };
         known_password.provide_for_connection(connection_options);
         known_password
     }
 
     pub fn provide_for_connection(&self, connection_options: &RemoteConnectionOptions) {
-        if let RemoteConnectionOptions::Ssh(options) = connection_options
+        if self.connection.as_ref() == Some(&RemoteConnectionTarget::from(connection_options))
+            && let RemoteConnectionOptions::Ssh(options) = connection_options
             && let Some(password) = options
                 .password
                 .as_deref()
@@ -476,7 +573,7 @@ impl KnownPassword {
     }
 
     fn provide(&self, password: EncryptedPassword) {
-        let mut state = self.0.lock();
+        let mut state = self.state.lock();
         for pending_prompt in state.pending_prompts.drain(..) {
             pending_prompt.send(password.clone()).ok();
         }
@@ -484,12 +581,12 @@ impl KnownPassword {
     }
 
     fn password(&self) -> Option<EncryptedPassword> {
-        self.0.lock().password.clone()
+        self.state.lock().password.clone()
     }
 
     fn wait_for_password(&self) -> oneshot::Receiver<EncryptedPassword> {
         let (password_tx, password_rx) = oneshot::channel();
-        let mut state = self.0.lock();
+        let mut state = self.state.lock();
         match state.password.clone() {
             Some(password) => {
                 password_tx.send(password).ok();
@@ -500,11 +597,35 @@ impl KnownPassword {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptActivation {
+    ActivateWindow,
+    RequestAttention,
+}
+
+impl PromptActivation {
+    pub fn for_connection(restoring_session: bool) -> Self {
+        if restoring_session {
+            Self::RequestAttention
+        } else {
+            Self::ActivateWindow
+        }
+    }
+
+    pub fn apply(self, window: &mut Window) {
+        match self {
+            Self::ActivateWindow => window.activate_window(),
+            Self::RequestAttention => window.request_attention(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteClientDelegate {
     window: AnyWindowHandle,
     ui: WeakEntity<RemoteConnectionPrompt>,
     known_password: KnownPassword,
+    prompt_activation: PromptActivation,
 }
 
 impl RemoteClientDelegate {
@@ -512,11 +633,13 @@ impl RemoteClientDelegate {
         window: AnyWindowHandle,
         ui: WeakEntity<RemoteConnectionPrompt>,
         known_password: KnownPassword,
+        prompt_activation: PromptActivation,
     ) -> Self {
         Self {
             window,
             ui,
             known_password,
+            prompt_activation,
         }
     }
 }
@@ -541,11 +664,16 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
         let provided_password = self.known_password.wait_for_password();
         self.show_prompt(prompt, prompt_tx, cancellation, cx);
         let ui = self.ui.clone();
+        let window = self.window;
         cx.spawn(async move |cx| {
-            let password = select! {
+            let password = select_biased! {
                 password = prompt_rx.fuse() => password.ok(),
                 password = provided_password.fuse() => {
-                    ui.update(cx, |modal, cx| modal.prompt_answered(cx)).ok();
+                    window
+                        .update(cx, |_, window, cx| {
+                            ui.update(cx, |modal, cx| modal.finish_prompt(window, cx))
+                        })
+                        .ok();
                     password.ok()
                 },
             };
@@ -633,7 +761,7 @@ impl RemoteClientDelegate {
         self.window
             .update(cx, |_, window, cx| {
                 self.ui.update(cx, |modal, cx| {
-                    window.activate_window();
+                    self.prompt_activation.apply(window);
                     modal.set_prompt(prompt, tx, cancellation, window, cx);
                 })
             })
@@ -807,11 +935,12 @@ pub fn connect(
     let (tx, mut rx) = oneshot::channel();
     ui.update(cx, |ui, _cx| ui.set_cancellation_tx(tx));
 
-    let delegate = Arc::new(RemoteClientDelegate {
+    let delegate = Arc::new(RemoteClientDelegate::new(
         window,
-        ui: ui.downgrade(),
+        ui.downgrade(),
         known_password,
-    });
+        PromptActivation::ActivateWindow,
+    ));
 
     cx.spawn(async move |cx| {
         let connection = remote::connect(connection_options, delegate.clone(), cx);
@@ -891,17 +1020,22 @@ mod tests {
     fn known_password_answers_only_password_prompts(cx: &mut TestAppContext) {
         initialize_test(cx);
         let confirmation = "Are you sure you want to continue connecting (yes/no/[fingerprint])?";
-        let connection_options = RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
-            host: "example.com".into(),
-            password: Some("secret".to_string()),
-            ..Default::default()
-        });
+        let ssh = |tag_argument: &str, password: Option<&str>| {
+            RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+                host: "example.com".into(),
+                password: password.map(String::from),
+                args: Some(vec![tag_argument.to_string()]),
+                ..Default::default()
+            })
+        };
+        let connection_options = ssh("-oTag=blue", Some("secret"));
+        let other_target = ssh("-oTag==blue", Some("other secret"));
 
         let mut outcomes = Vec::new();
-        for (prompt_text, password_known_upfront) in [
-            ("Password:", false),
-            (confirmation, false),
-            (confirmation, true),
+        for (prompt_text, password_known_upfront, provider) in [
+            ("Password:", false, &connection_options),
+            (confirmation, true, &connection_options),
+            ("Password:", false, &other_target),
         ] {
             let window = cx.add_window(|window, cx| Editor::single_line(window, cx));
             let prompt = window
@@ -918,14 +1052,15 @@ mod tests {
                     })
                 })
                 .expect("test window should remain open");
-            let known_password = KnownPassword::default();
+            let known_password = KnownPassword::for_connection(&ssh("-oTag=blue", None));
             if password_known_upfront {
-                known_password.provide_for_connection(&connection_options);
+                known_password.provide_for_connection(provider);
             }
             let delegate = RemoteClientDelegate::new(
                 window.into(),
                 prompt.downgrade(),
                 known_password.clone(),
+                PromptActivation::ActivateWindow,
             );
 
             let (response_sender, mut response_receiver) = oneshot::channel();
@@ -939,8 +1074,13 @@ mod tests {
             );
             cx.run_until_parked();
             let prompt_shown = prompt.read_with(cx, |prompt, _| prompt.prompt.is_some());
+            window
+                .update(cx, |_, window, cx| {
+                    prompt.update(cx, |prompt, cx| prompt.editor.set_text("typed", window, cx))
+                })
+                .expect("test window should remain open");
 
-            known_password.provide_for_connection(&connection_options);
+            known_password.provide_for_connection(provider);
             cx.run_until_parked();
 
             let answer = response_receiver
@@ -952,21 +1092,141 @@ mod tests {
                         .decrypt(askpass::IKnowWhatIAmDoingAndIHaveReadTheDocs)
                         .ok()
                 });
-            outcomes.push((
-                prompt_shown,
-                answer,
-                prompt.read_with(cx, |prompt, _| prompt.prompt.is_some()),
-            ));
+            outcomes.push(prompt.read_with(cx, |prompt, cx| {
+                (
+                    prompt_shown,
+                    answer,
+                    prompt.prompt.is_some(),
+                    prompt.editor.text(cx),
+                )
+            }));
         }
 
         assert_eq!(
             outcomes,
             vec![
-                (true, Some("secret".to_string()), false),
-                (true, None, true),
-                (true, None, true),
+                (true, Some("secret".to_string()), false, String::new()),
+                (true, None, true, "typed".to_string()),
+                (true, None, true, "typed".to_string()),
             ]
         );
+    }
+
+    #[gpui::test]
+    fn password_prompts_activate_their_window_only_when_allowed(cx: &mut TestAppContext) {
+        initialize_test(cx);
+        let mut active_windows = Vec::new();
+        for prompt_activation in [
+            PromptActivation::RequestAttention,
+            PromptActivation::ActivateWindow,
+        ] {
+            let window = cx.add_window(|window, cx| Editor::single_line(window, cx));
+            let other_window = cx.add_window(|window, cx| Editor::single_line(window, cx));
+            other_window
+                .update(cx, |_, window, _| window.activate_window())
+                .expect("test window should remain open");
+            let prompt = window
+                .update(cx, |_, window, cx| {
+                    cx.new(|cx| {
+                        RemoteConnectionPrompt::new(
+                            "example.com".to_string(),
+                            None,
+                            false,
+                            false,
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .expect("test window should remain open");
+            let delegate = RemoteClientDelegate::new(
+                window.into(),
+                prompt.downgrade(),
+                KnownPassword::default(),
+                prompt_activation,
+            );
+            let (response_sender, _response_receiver) = oneshot::channel();
+            let (_cancellation_sender, cancellation) = oneshot::channel();
+            remote::RemoteClientDelegate::ask_password(
+                &delegate,
+                "Password:".to_string(),
+                response_sender,
+                cancellation,
+                &mut cx.to_async(),
+            );
+            cx.run_until_parked();
+            let prompt_shown = prompt.read_with(cx, |prompt, _| prompt.prompt.is_some());
+            let active_window = cx.read(|cx| cx.active_window());
+            active_windows.push((
+                prompt_shown,
+                active_window == Some(window.into()),
+                active_window == Some(other_window.into()),
+            ));
+        }
+
+        assert_eq!(
+            active_windows,
+            vec![(true, false, true), (true, true, false)]
+        );
+    }
+
+    #[gpui::test]
+    fn late_password_does_not_clear_replacement_confirmation(cx: &mut TestAppContext) {
+        initialize_test(cx);
+        let window = cx.add_window(|window, cx| Editor::single_line(window, cx));
+        let prompt = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    RemoteConnectionPrompt::new(
+                        "example.com".to_string(),
+                        None,
+                        false,
+                        false,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("test window should remain open");
+
+        for _ in 0..32 {
+            let known_password = KnownPassword::default();
+            let delegate = RemoteClientDelegate::new(
+                window.into(),
+                prompt.downgrade(),
+                known_password.clone(),
+                PromptActivation::RequestAttention,
+            );
+            let (password_tx, mut password_rx) = oneshot::channel();
+            let (_password_cancel, password_cancellation) = oneshot::channel();
+            remote::RemoteClientDelegate::ask_password(
+                &delegate,
+                "Password:".to_string(),
+                password_tx,
+                password_cancellation,
+                &mut cx.to_async(),
+            );
+            let (confirmation_tx, mut confirmation_rx) = oneshot::channel();
+            let (_confirmation_cancel, confirmation_cancellation) = oneshot::channel();
+            remote::RemoteClientDelegate::ask_password(
+                &delegate,
+                "Continue connecting (yes/no)?".to_string(),
+                confirmation_tx,
+                confirmation_cancellation,
+                &mut cx.to_async(),
+            );
+            known_password.provide(EncryptedPassword::try_from("secret").unwrap());
+            cx.run_until_parked();
+
+            assert_eq!(
+                (
+                    password_rx.try_recv().is_err(),
+                    confirmation_rx.try_recv().unwrap().is_none(),
+                    prompt.read_with(cx, |prompt, _| prompt.prompt.is_some()),
+                ),
+                (true, true, true)
+            );
+        }
     }
 
     #[gpui::test]

@@ -1157,7 +1157,12 @@ pub struct AgentPanel {
 }
 
 impl AgentPanel {
-    fn serialize(&mut self, cx: &mut App) {
+    fn serialize(&mut self, cx: &mut Context<Self>) {
+        cx.emit(PanelEvent::PersistenceChanged);
+        self.write_serialization(cx);
+    }
+
+    fn write_serialization(&mut self, cx: &mut App) {
         let Some(workspace_id) = self.workspace_id else {
             return;
         };
@@ -5063,6 +5068,13 @@ impl Panel for AgentPanel {
         position != DockPosition::Bottom
     }
 
+    fn flush_serialization(&mut self, _: &Workspace, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.write_serialization(cx);
+        self.pending_serialization
+            .take()
+            .unwrap_or_else(|| Task::ready(Ok(())))
+    }
+
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         let side = match position {
             DockPosition::Left => "left",
@@ -7510,7 +7522,9 @@ mod tests {
 
         // Set up workspace B: ClaudeCode, no active thread.
         let panel_b = workspace_b.update_in(cx, |workspace, window, cx| {
-            cx.new(|cx| AgentPanel::new(workspace, window, cx))
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
         });
 
         cx.update(|_window, cx| install_custom_agent("claude-acp", cx));
@@ -7519,11 +7533,32 @@ mod tests {
                 id: "claude-acp".into(),
             };
         });
+        cx.run_until_parked();
+        let persistence_changes = Rc::new(Cell::new(0));
+        let _subscription = panel_b.update(cx, |_, cx| {
+            let persistence_changes = persistence_changes.clone();
+            cx.subscribe(&panel_b, move |_, _, event: &PanelEvent, _| {
+                if let PanelEvent::PersistenceChanged = event {
+                    persistence_changes.set(persistence_changes.get() + 1);
+                }
+            })
+        });
 
         // Serialize both panels.
         panel_a.update(cx, |panel, cx| panel.serialize(cx));
-        panel_b.update(cx, |panel, cx| panel.serialize(cx));
+        workspace_b.update(cx, |_, cx| {
+            panel_b.update(cx, |panel, cx| panel.serialize(cx));
+        });
         cx.run_until_parked();
+        assert_eq!(persistence_changes.get(), 1);
+        workspace_b
+            .update(cx, |workspace, cx| {
+                panel_b.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(persistence_changes.get(), 1);
 
         let workspace_a_id = workspace_a
             .read_with(cx, |workspace, _cx| workspace.database_id())

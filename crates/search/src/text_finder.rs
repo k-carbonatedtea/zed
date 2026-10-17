@@ -624,7 +624,7 @@ mod tests {
         let persistence_task = workspace.update_in(cx, |workspace, window, cx| {
             workspace.flush_serialization(window, cx)
         });
-        persistence_task.await;
+        persistence_task.await.unwrap();
 
         let initial_query = "unique_search_query";
         let seed_query = SearchSeed {

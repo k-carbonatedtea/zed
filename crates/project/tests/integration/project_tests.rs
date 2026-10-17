@@ -8931,6 +8931,82 @@ async fn test_edit_buffer_while_it_reloads(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_reload_keeps_edits_made_while_reading_the_file(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "file1": "the original contents" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file1"), cx))
+        .await
+        .unwrap();
+
+    fs.save(
+        path!("/dir/file1").as_ref(),
+        &"the first contents".into(),
+        LineEnding::default(),
+    )
+    .await
+    .unwrap();
+    let reload = buffer.update(cx, |buffer, cx| {
+        let reload = buffer.reload(cx);
+        buffer.edit([(0..0, "live ")], None, cx);
+        reload
+    });
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        (
+            reload.now_or_never().map(|transaction| transaction.is_ok()),
+            buffer.read_with(cx, |buffer, _| (
+                buffer.text(),
+                buffer.is_dirty(),
+                buffer.has_conflict()
+            )),
+        ),
+        (
+            Some(false),
+            ("live the original contents".to_string(), true, true)
+        )
+    );
+}
+
+#[gpui::test]
+async fn test_rejected_reload_keeps_earlier_edits_unsaved(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "file1": "disk" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file1"), cx))
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+
+    let reload = buffer.update(cx, |buffer, cx| {
+        let reload = buffer.reload(cx);
+        buffer.edit([(buffer.len()..buffer.len(), "!")], None, cx);
+        reload
+    });
+    cx.executor().run_until_parked();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(buffer.len() - 1..buffer.len(), "")], None, cx)
+    });
+
+    assert_eq!(
+        (
+            reload.now_or_never().map(|transaction| transaction.is_ok()),
+            buffer.read_with(cx, |buffer, _| (buffer.text(), buffer.has_unsaved_edits())),
+        ),
+        (Some(false), ("unsaved disk".to_string(), true))
+    );
+}
+
+#[gpui::test]
 async fn test_save_in_single_file_worktree(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
@@ -8963,6 +9039,51 @@ async fn test_save_in_single_file_worktree(cx: &mut gpui::TestAppContext) {
         .unwrap()
         .replace("\r\n", "\n");
     assert_eq!(new_text, buffer.update(cx, |buffer, _| buffer.text()));
+}
+
+#[gpui::test]
+async fn test_cancelled_cli_environment_request_keeps_the_previous_request(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "file.txt": "text" }))
+        .await;
+    let project = Project::test(fs, [], cx).await;
+    let environment = project.read_with(cx, |project, _| project.environment().clone());
+    let root = Arc::<Path>::from(Path::new(path!("/dir")));
+    let request = environment.update(cx, |environment, _| {
+        environment.request_cli_environment_for_roots(
+            [root.clone()],
+            HashMap::from_iter([(String::from("REQUEST"), String::from("original"))]),
+        )
+    });
+    let cancelled = environment.update(cx, |environment, _| {
+        environment.request_cli_environment_for_roots(
+            [root],
+            HashMap::from_iter([(String::from("REQUEST"), String::from("cancelled"))]),
+        )
+    });
+    drop(cancelled);
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/dir"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    drop(request);
+
+    assert_eq!(
+        environment
+            .update(cx, |environment, cx| environment
+                .worktree_environment(worktree, cx))
+            .await,
+        Some(HashMap::from_iter([
+            (String::from("REQUEST"), String::from("original")),
+            (String::from("ZED_ENVIRONMENT"), String::from("cli")),
+        ]))
+    );
 }
 
 #[gpui::test]
@@ -9017,6 +9138,35 @@ async fn test_save_as(cx: &mut gpui::TestAppContext) {
         .await
         .unwrap();
     assert_eq!(opened_buffer, buffer);
+
+    project
+        .update(cx, |project, cx| {
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+            project.save_buffer_as(
+                buffer.clone(),
+                ProjectPath {
+                    worktree_id,
+                    path: rel_path("file1.rs").into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(buffer.len()..buffer.len(), "!")], None, cx)
+    });
+    let reopened_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/file1.rs", cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(reopened_buffer, buffer);
+    assert_eq!(
+        reopened_buffer.read_with(cx, |buffer, _| buffer.text()),
+        "abc!"
+    );
 }
 
 #[gpui::test]
@@ -18417,6 +18567,38 @@ async fn test_project_group_keys_remain_distinct_for_sibling_repo_subdirectories
             .map(|path| path.as_path())
             .collect::<Vec<_>>(),
         vec![Path::new(path!("/root/my-repo/packages/b"))]
+    );
+}
+
+#[test]
+fn test_project_group_keys_identify_remote_hosts_by_connection_target() {
+    let key = |args: Option<&[&str]>, nickname: Option<&str>| {
+        ProjectGroupKey::new(
+            Some(remote::RemoteConnectionOptions::Ssh(
+                remote::SshConnectionOptions {
+                    host: "host".into(),
+                    args: args.map(|args| args.iter().map(|arg| arg.to_string()).collect()),
+                    nickname: nickname.map(String::from),
+                    ..remote::SshConnectionOptions::default()
+                },
+            )),
+            util::path_list::PathList::new(&[Path::new("/project")]),
+        )
+    };
+    let legacy = key(None, None);
+    let normalized = key(Some(&[]), Some("work"));
+    let other_target = key(Some(&["-oHostKeyAlias=other"]), None);
+
+    assert_eq!(
+        (
+            legacy == normalized,
+            legacy == other_target,
+            [legacy, normalized, other_target]
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .len(),
+        ),
+        (true, false, 2)
     );
 }
 

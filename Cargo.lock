@@ -5554,6 +5554,7 @@ dependencies = [
  "db",
  "edit_prediction_types",
  "emojis",
+ "encoding_rs",
  "feature_flags",
  "file_icons",
  "fs",
@@ -15090,6 +15091,7 @@ dependencies = [
  "thiserror 2.0.17",
  "urlencoding",
  "util",
+ "uuid",
  "which",
 ]
 

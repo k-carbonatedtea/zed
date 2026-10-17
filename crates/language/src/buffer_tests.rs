@@ -15,8 +15,10 @@ use settings::SettingsStore;
 use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
 use std::collections::BTreeSet;
 use std::{
+    cell::Cell,
     env,
     ops::Range,
+    rc::Rc,
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -705,6 +707,25 @@ fn test_edit_events(cx: &mut gpui::App) {
             BufferEvent::DirtyChanged
         ]
     );
+}
+
+#[gpui::test]
+fn test_saved_state_changes_notify_change_listeners(cx: &mut App) {
+    init_settings(cx, |_| {});
+    cx.new(|cx| {
+        let mut buffer = Buffer::local("", cx);
+        let changed = Rc::new(Cell::new(false));
+        buffer.record_changes(Rc::downgrade(&changed));
+        let mut notified = Vec::new();
+
+        buffer.set_conflict();
+        notified.push(changed.replace(false));
+        buffer.did_reload(buffer.version(), buffer.line_ending(), None, cx);
+        notified.push(changed.replace(false));
+
+        assert_eq!(notified, vec![true, true]);
+        buffer
+    });
 }
 
 #[gpui::test]

@@ -1301,9 +1301,7 @@ impl OutlinePanel {
 
     fn serialization_key(workspace: &Workspace) -> Option<String> {
         workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())
+            .serialization_scope()
             .map(|id| format!("{}-{:?}", OUTLINE_PANEL_KEY, id))
     }
 
@@ -5607,6 +5605,18 @@ impl Panel for OutlinePanel {
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
         matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    fn flush_serialization(
+        &mut self,
+        _: &Workspace,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let pending = std::mem::replace(&mut self.pending_serialization, Task::ready(None));
+        cx.background_spawn(async move {
+            pending.await;
+            Ok(())
+        })
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {

@@ -19,6 +19,37 @@ include!(concat!(env!("OUT_DIR"), "/zed.messages.rs"));
 pub const REMOTE_SERVER_PEER_ID: PeerId = PeerId { owner_id: 0, id: 0 };
 pub const REMOTE_SERVER_PROJECT_ID: u64 = 0;
 
+impl EnvelopedMessage for ToggleBreakpointResponse {
+    const NAME: &'static str = "ToggleBreakpointResponse";
+    const PRIORITY: MessagePriority = MessagePriority::Foreground;
+
+    fn into_envelope(
+        self,
+        id: u32,
+        responding_to: Option<u32>,
+        original_sender_id: Option<PeerId>,
+    ) -> Envelope {
+        if self.version == 0 && self.processed_breakpoints <= 1 {
+            return Ack {}.into_envelope(id, responding_to, original_sender_id);
+        }
+        Envelope {
+            id,
+            responding_to,
+            original_sender_id,
+            payload: Some(envelope::Payload::ToggleBreakpointResponse(self)),
+            ack_id: None,
+        }
+    }
+
+    fn from_envelope(envelope: Envelope) -> Option<Self> {
+        match envelope.payload? {
+            envelope::Payload::Ack(_) => Some(Self::default()),
+            envelope::Payload::ToggleBreakpointResponse(response) => Some(response),
+            _ => None,
+        }
+    }
+}
+
 impl Envelope {
     #[inline(never)]
     pub fn decode_from_slice(buffer: &[u8]) -> Result<Self, DecodeError> {
@@ -640,7 +671,7 @@ request_messages!(
     (CheckForPushedCommits, CheckForPushedCommitsResponse),
     (GitDiff, GitDiffResponse),
     (GitInit, Ack),
-    (ToggleBreakpoint, Ack),
+    (ToggleBreakpoint, ToggleBreakpointResponse),
     (GetDebugAdapterBinary, DebugAdapterBinary),
     (RunDebugLocators, DebugRequest),
     (GetDocumentDiagnostics, GetDocumentDiagnosticsResponse),
@@ -1125,6 +1156,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_breakpoint_responses_preserve_legacy_ack_envelopes() {
+        let request = ToggleBreakpoint {
+            project_id: 3,
+            path: String::from("/a"),
+            breakpoint: None,
+            edit: BreakpointEdit::Set as i32,
+            additional_breakpoints: vec![Breakpoint::default()],
+        };
+        let forwarded = LegacyToggleBreakpoint::decode(request.encode_to_vec().as_slice()).unwrap();
+        let forwarded_bytes = forwarded.encode_to_vec();
+        assert_eq!(forwarded_bytes, [8, 3, 18, 2, 47, 97]);
+        assert_eq!(
+            ToggleBreakpoint::decode(forwarded_bytes.as_slice())
+                .unwrap()
+                .edit(),
+            BreakpointEdit::Toggle
+        );
+
+        let legacy_bytes = [8, 7, 16, 11, 42, 0];
+        let legacy = Envelope::decode(legacy_bytes.as_slice()).unwrap();
+        assert_eq!(Ack::from_envelope(legacy.clone()), Some(Ack {}));
+        assert_eq!(
+            ToggleBreakpointResponse::from_envelope(legacy),
+            Some(ToggleBreakpointResponse {
+                version: 0,
+                processed_breakpoints: 0
+            })
+        );
+        assert_eq!(
+            ToggleBreakpointResponse {
+                version: 0,
+                processed_breakpoints: 0
+            }
+            .into_envelope(7, Some(11), None)
+            .encode_to_vec(),
+            legacy_bytes
+        );
+
+        for (version, processed_breakpoints, bytes) in [
+            (23, 0, vec![8, 7, 16, 11, 130, 31, 2, 8, 23]),
+            (23, 2, vec![8, 7, 16, 11, 130, 31, 4, 8, 23, 16, 2]),
+            (0, 2, vec![8, 7, 16, 11, 130, 31, 2, 16, 2]),
+        ] {
+            let response = ToggleBreakpointResponse {
+                version,
+                processed_breakpoints,
+            };
+            assert_eq!(
+                response.into_envelope(7, Some(11), None).encode_to_vec(),
+                bytes
+            );
+            assert_eq!(
+                ToggleBreakpointResponse::from_envelope(
+                    Envelope::decode(bytes.as_slice()).unwrap()
+                ),
+                Some(response)
+            );
+        }
+        assert_eq!(
+            ToggleBreakpointResponse::from_envelope(Ping {}.into_envelope(7, Some(11), None)),
+            None
+        );
+    }
+
+    #[test]
     fn test_converting_peer_id_from_and_to_u64() {
         let peer_id = PeerId {
             owner_id: 10,
@@ -1180,5 +1276,15 @@ mod tests {
         assert!(!chunks[0].is_last_update);
         assert!(!chunks[1].is_last_update);
         assert!(chunks[2].is_last_update);
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyToggleBreakpoint {
+        #[prost(uint64, tag = "1")]
+        project_id: u64,
+        #[prost(string, tag = "2")]
+        path: String,
+        #[prost(message, optional, tag = "3")]
+        breakpoint: Option<Breakpoint>,
     }
 }

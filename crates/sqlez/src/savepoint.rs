@@ -1,5 +1,6 @@
 use anyhow::Result;
 use indoc::formatdoc;
+use libsqlite3_sys::sqlite3_get_autocommit;
 
 use crate::connection::Connection;
 
@@ -13,18 +14,7 @@ impl Connection {
     {
         let name = name.as_ref();
         self.exec(&format!("SAVEPOINT {name}"))?()?;
-        let result = f();
-        match result {
-            Ok(_) => {
-                self.exec(&format!("RELEASE {name}"))?()?;
-            }
-            Err(_) => {
-                self.exec(&formatdoc! {"
-                    ROLLBACK TO {name};
-                    RELEASE {name}"})?()?;
-            }
-        }
-        result
+        self.finish_savepoint(name, f(), false)
     }
 
     // Run a set of commands within the context of a `SAVEPOINT name`. If the callback
@@ -37,14 +27,31 @@ impl Connection {
         let name = name.as_ref();
         self.exec(&format!("SAVEPOINT {name}"))?()?;
         let result = f();
-        match result {
-            Ok(Some(_)) => {
+        let rollback = matches!(result, Ok(None));
+        self.finish_savepoint(name, result, rollback)
+    }
+
+    fn finish_savepoint<R>(&self, name: &str, result: Result<R>, rollback: bool) -> Result<R> {
+        let result = result.and_then(|value| {
+            if !rollback {
                 self.exec(&format!("RELEASE {name}"))?()?;
             }
-            Ok(None) | Err(_) => {
-                self.exec(&formatdoc! {"
+            Ok(value)
+        });
+
+        if (rollback || result.is_err()) && unsafe { sqlite3_get_autocommit(self.sqlite3) } == 0 {
+            let rollback_result = self
+                .exec(&formatdoc! {"
                     ROLLBACK TO {name};
-                    RELEASE {name}"})?()?;
+                    RELEASE {name}"})
+                .and_then(|mut execute| execute());
+            if let Err(rollback_error) = rollback_result {
+                return Err(match result {
+                    Ok(_) => rollback_error,
+                    Err(error) => error.context(format!(
+                        "Failed to roll back savepoint {name}: {rollback_error:#}"
+                    )),
+                });
             }
         }
         result
@@ -56,6 +63,59 @@ mod tests {
     use crate::connection::Connection;
     use anyhow::Result;
     use indoc::indoc;
+    use libsqlite3_sys::sqlite3_get_autocommit;
+    use std::cell::Cell;
+
+    #[test]
+    fn test_release_failure_rolls_back() -> Result<()> {
+        for rollback_on_none in [false, true] {
+            let connection = Connection::open_memory(None);
+            connection.exec("PRAGMA foreign_keys = ON")?()?;
+            connection.exec("CREATE TABLE parent (id INTEGER PRIMARY KEY)")?()?;
+            connection.exec(indoc! {"
+                CREATE TABLE child (
+                    parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+                )"})?()?;
+            connection.exec("INSERT INTO parent VALUES (1); INSERT INTO child VALUES (1)")?()?;
+
+            let callback_completed = Cell::new(false);
+            let savepoint = || {
+                let write = || {
+                    connection.exec("UPDATE child SET parent_id = 2")?()?;
+                    callback_completed.set(true);
+                    Ok(())
+                };
+                if rollback_on_none {
+                    connection
+                        .with_savepoint_rollback("release_failure", || write().map(Some))
+                        .map(|_| ())
+                } else {
+                    connection.with_savepoint("release_failure", write)
+                }
+            };
+
+            assert!(savepoint().is_err());
+            assert!(callback_completed.get());
+            assert_eq!(
+                connection.select::<i32>("SELECT parent_id FROM child")?()?,
+                vec![1]
+            );
+            assert_eq!(unsafe { sqlite3_get_autocommit(connection.sqlite3) }, 1);
+
+            connection.with_savepoint("outer", || {
+                savepoint()?;
+                assert_eq!(unsafe { sqlite3_get_autocommit(connection.sqlite3) }, 0);
+                connection.exec("INSERT INTO parent VALUES (2)")?()
+            })?;
+
+            assert_eq!(
+                connection.select::<i32>("SELECT parent_id FROM child")?()?,
+                vec![2]
+            );
+            assert_eq!(unsafe { sqlite3_get_autocommit(connection.sqlite3) }, 1);
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_nested_savepoints() -> Result<()> {

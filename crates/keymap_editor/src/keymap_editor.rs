@@ -3979,12 +3979,12 @@ impl SerializableItem for KeymapEditor {
 
     fn serialize(
         &mut self,
-        workspace: &mut Workspace,
+        workspace_id: Option<workspace::WorkspaceId>,
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut ui::Context<Self>,
     ) -> Option<gpui::Task<gpui::Result<()>>> {
-        let workspace_id = workspace.database_id()?;
+        let workspace_id = workspace_id?;
         let db = KeybindingEditorDb::global(cx);
         Some(cx.background_spawn(
             async move { db.save_keybinding_editor(item_id, workspace_id).await },

@@ -860,13 +860,13 @@ impl SerializableItem for ComponentPreview {
 
     fn serialize(
         &mut self,
-        _workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         item_id: ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let active_page = self.active_page_id(cx);
-        let workspace_id = self.workspace_id?;
+        let workspace_id = workspace_id?;
         let db = ComponentPreviewDb::global(cx);
         Some(cx.background_spawn(async move {
             db.save_active_page(item_id, workspace_id, active_page.0)

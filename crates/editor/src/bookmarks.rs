@@ -89,7 +89,7 @@ impl Editor {
 
         let mut selections = self.selections.all::<Point>(&snapshot.display_snapshot);
         selections.sort_unstable_by_key(|s| s.head());
-        selections.dedup_by_key(|s| s.head().row);
+        let mut buffer_rows = HashSet::default();
 
         let mut exist_targets: Vec<BookmarkTarget> = vec![];
         let mut absent_targets: Vec<BookmarkTarget> = vec![];
@@ -98,10 +98,16 @@ impl Editor {
             let head = selection.head();
             let multibuffer_anchor = multi_buffer_snapshot.anchor_before(Point::new(head.row, 0));
 
-            if let Some((buffer_anchor, _)) =
+            if let Some((buffer_anchor, buffer_snapshot)) =
                 multi_buffer_snapshot.anchor_to_buffer_anchor(multibuffer_anchor)
             {
                 let buffer_id = buffer_anchor.buffer_id;
+                let buffer_row = buffer_snapshot
+                    .summary_for_anchor::<Point>(&buffer_anchor)
+                    .row;
+                if !buffer_rows.insert((buffer_id, buffer_row)) {
+                    continue;
+                }
                 if let Some(buffer) = project.read(cx).buffer_for_id(buffer_id, cx) {
                     let target = BookmarkTarget {
                         buffer,

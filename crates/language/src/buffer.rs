@@ -1737,7 +1737,9 @@ impl Buffer {
 
             let diff = this.update(cx, |this, cx| this.diff(new_text, cx))?.await;
             this.update(cx, |this, cx| {
-                if this.version() == diff.base_version {
+                if this.version() == diff.base_version
+                    && this.edits_since::<usize>(&prev_version).next().is_none()
+                {
                     this.finalize_last_transaction();
                     let old_encoding = this.encoding;
                     let old_has_bom = this.has_bom;
@@ -1752,7 +1754,7 @@ impl Buffer {
                         }
                     }
                     tx.send(transaction).ok();
-                    this.has_conflict = false;
+                    this.set_has_conflict(false);
                     this.did_reload(this.version(), this.line_ending(), new_mtime, cx);
                 } else {
                     if !diff.edits.is_empty()
@@ -1761,10 +1763,9 @@ impl Buffer {
                             .next()
                             .is_some()
                     {
-                        this.has_conflict = true;
+                        this.set_has_conflict(true);
                     }
-
-                    this.did_reload(prev_version, this.line_ending(), this.saved_mtime, cx);
+                    cx.notify();
                 }
 
                 this.reload_task.take();
@@ -1786,6 +1787,7 @@ impl Buffer {
             .set((self.saved_version.clone(), false));
         self.text.set_line_ending(line_ending);
         self.saved_mtime = mtime;
+        self.was_changed();
         cx.emit(BufferEvent::Reloaded);
         cx.notify();
     }
@@ -2531,9 +2533,10 @@ impl Buffer {
 
     /// Checks if the buffer has unsaved changes.
     pub fn is_dirty(&self) -> bool {
-        if self.capability == Capability::ReadOnly {
-            return false;
-        }
+        self.capability != Capability::ReadOnly && self.holds_unsaved_changes()
+    }
+
+    pub fn holds_unsaved_changes(&self) -> bool {
         if self.has_conflict {
             return true;
         }
@@ -2547,7 +2550,15 @@ impl Buffer {
 
     /// Marks the buffer as having a conflict regardless of current buffer state.
     pub fn set_conflict(&mut self) {
-        self.has_conflict = true;
+        self.reload_task.take();
+        self.set_has_conflict(true);
+    }
+
+    fn set_has_conflict(&mut self, has_conflict: bool) {
+        if self.has_conflict != has_conflict {
+            self.has_conflict = has_conflict;
+            self.was_changed();
+        }
     }
 
     /// Checks if the buffer and its file have both changed since the buffer
@@ -3470,6 +3481,7 @@ impl Buffer {
                 self.saved_version = self.version.clone();
                 self.has_unsaved_edits
                     .set((self.saved_version.clone(), false));
+                self.was_changed();
             }
             self.reload_with_encoding_txns
                 .insert(transaction_id, (current_encoding, current_has_bom));

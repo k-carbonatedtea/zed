@@ -518,7 +518,7 @@ impl SerializableItem for UnstagedDiff {
 
     fn serialize(
         &mut self,
-        _: &mut Workspace,
+        _: Option<workspace::WorkspaceId>,
         _: workspace::ItemId,
         _: bool,
         _: &mut Context<Self>,

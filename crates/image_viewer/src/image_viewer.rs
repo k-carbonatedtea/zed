@@ -734,12 +734,12 @@ impl SerializableItem for ImageView {
 
     fn serialize(
         &mut self,
-        workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         item_id: ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
-        let workspace_id = workspace.database_id()?;
+        let workspace_id = workspace_id?;
         let image_path = self.image_item.read(cx).abs_path(cx)?;
 
         let db = ImageViewerDb::global(cx);

@@ -1,5 +1,7 @@
 use anyhow::{Context as _, Result};
+use collections::HashMap;
 use fs::Fs;
+use futures::{FutureExt as _, future::Shared};
 
 use gpui::{
     AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
@@ -8,14 +10,14 @@ use gpui::{
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
-use remote::RemoteConnectionOptions;
+use remote::{RemoteConnectionOptions, RemoteConnectionTarget};
 use settings::Settings;
 pub use settings::SidebarSide;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use ui::prelude::*;
-#[cfg(any(test, feature = "test-support"))]
 use util::ResultExt;
 use util::path_list::PathList;
 use zed_actions::agents_sidebar::ToggleThreadSwitcher;
@@ -28,8 +30,8 @@ const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
-    CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
-    Panel, Workspace, WorkspaceId, client_side_decorations,
+    CloseIntent, CloseWindow, DiscardedItems, DockPosition, Event as WorkspaceEvent, Item,
+    ModalView, OpenMode, Panel, Workspace, WorkspaceId, client_side_decorations,
     persistence::model::MultiWorkspaceState,
 };
 
@@ -327,7 +329,9 @@ pub struct MultiWorkspace {
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
-    pending_removal_tasks: Vec<Task<()>>,
+    pending_removal_tasks: Vec<(EntityId, Shared<Task<Result<(), Arc<anyhow::Error>>>>)>,
+    pending_restored_state: Option<MultiWorkspaceState>,
+    persistence_generation: u64,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -350,12 +354,15 @@ impl MultiWorkspace {
     }
 
     pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let release_subscription = cx.on_release(|this: &mut MultiWorkspace, _cx| {
+        let release_subscription = cx.on_release(|this: &mut MultiWorkspace, cx| {
             if let Some(task) = this._serialize_task.take() {
                 task.detach();
             }
-            for task in std::mem::take(&mut this.pending_removal_tasks) {
-                task.detach();
+            for (_, task) in std::mem::take(&mut this.pending_removal_tasks) {
+                cx.background_spawn(async move {
+                    task.await.map_err(|error| anyhow::anyhow!("{error:#}"))
+                })
+                .detach_and_log_err(cx);
             }
         });
         let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
@@ -374,7 +381,7 @@ impl MultiWorkspace {
         let weak_self = cx.weak_entity();
         let active_workspace_id = Rc::new(Cell::new(workspace.entity_id()));
         workspace.update(cx, |workspace, cx| {
-            workspace.set_multi_workspace(weak_self, active_workspace_id.clone(), cx);
+            workspace.set_multi_workspace(weak_self, active_workspace_id.clone(), window, cx);
         });
         Self {
             window_id: window.window_handle().window_id(),
@@ -389,6 +396,8 @@ impl MultiWorkspace {
             sidebar_open: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
+            pending_restored_state: None,
+            persistence_generation: 0,
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -576,27 +585,22 @@ impl MultiWorkspace {
                 return anyhow::Ok(());
             }
 
-            crate::flush_windows_serialization(&[window_handle], cx).await;
-
-            window_handle
-                .update(cx, |_, window, _cx| {
-                    window.remove_window();
-                })
-                .context("removing the closed window")?;
-
-            cx.update(|cx| {
-                if cx
-                    .windows()
-                    .iter()
-                    .all(|window| window.downcast::<MultiWorkspace>().is_none())
-                {
-                    cx.default_global::<LastWindowCloses>().0 += 1;
-                }
-            });
-
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    pub(crate) fn finish_close(&self, window: &mut Window, cx: &mut App) {
+        let closed_window = window.window_handle();
+        if cx
+            .windows()
+            .into_iter()
+            .filter(|window| *window != closed_window)
+            .all(|window| window.downcast::<MultiWorkspace>().is_none())
+        {
+            cx.default_global::<LastWindowCloses>().0 += 1;
+        }
+        window.remove_window();
     }
 
     fn subscribe_to_workspace(
@@ -770,6 +774,7 @@ impl MultiWorkspace {
         if let Some(index) = self.held_index(&workspace) {
             return index;
         }
+        self.persistence_generation += 1;
         self.register_workspace(&workspace, window, cx);
         self.held.push(HeldWorkspace {
             workspace,
@@ -815,7 +820,7 @@ impl MultiWorkspace {
         let weak_self = cx.weak_entity();
         let active_workspace_id = self.active_workspace_id.clone();
         workspace.update(cx, |workspace, cx| {
-            workspace.set_multi_workspace(weak_self, active_workspace_id, cx);
+            workspace.set_multi_workspace(weak_self, active_workspace_id, window, cx);
         });
 
         let entity = cx.entity();
@@ -1055,19 +1060,23 @@ impl MultiWorkspace {
             }));
         }
 
-        let remove_task = self.remove_project_group(key, window, cx);
-
-        cx.spawn(async move |_this, cx| {
-            futures::future::join_all(serialization_tasks).await;
-
-            let removed = remove_task.await?;
+        let key = key.clone();
+        cx.spawn_in(window, async move |multi_workspace, cx| {
+            for result in futures::future::join_all(serialization_tasks).await {
+                result?;
+            }
+            let removed = multi_workspace
+                .update_in(cx, |multi_workspace, window, cx| {
+                    multi_workspace.remove_project_group(&key, window, cx)
+                })?
+                .await?;
             if !removed {
                 return Ok(());
             }
 
-            cx.update(|cx| {
+            cx.update(|_, cx| {
                 Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
-            })
+            })?
             .await?;
 
             Ok(())
@@ -1084,7 +1093,8 @@ impl MultiWorkspace {
         for workspace in self.workspaces() {
             let root_paths = PathList::new(&workspace.read(cx).root_paths(cx));
             let key = workspace.read(cx).project_group_key(cx);
-            let host_matches = key.host().as_ref() == host;
+            let host_matches = key.host().as_ref().map(RemoteConnectionTarget::from)
+                == host.map(RemoteConnectionTarget::from);
             let paths_match = root_paths == *path_list;
             if host_matches && paths_match {
                 return Some(workspace.clone());
@@ -1134,6 +1144,7 @@ impl MultiWorkspace {
                 paths,
                 provisional_project_group_key,
                 init,
+                None,
                 open_mode,
                 source_workspace,
                 window,
@@ -1222,6 +1233,7 @@ impl MultiWorkspace {
         path_list: PathList,
         project_group: Option<ProjectGroupKey>,
         init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        env: Option<HashMap<String, String>>,
         open_mode: OpenMode,
         source_workspace: Option<WeakEntity<Workspace>>,
         window: &mut Window,
@@ -1287,7 +1299,7 @@ impl MultiWorkspace {
                         effective_path_list.paths().to_vec(),
                         app_state,
                         requesting_window,
-                        None,
+                        env,
                         init,
                         open_mode,
                         cx,
@@ -1311,6 +1323,7 @@ impl MultiWorkspace {
     /// persistent list regardless of sidebar state — it's used for system-
     /// initiated additions like deserialization and worktree discovery.
     pub fn add(&mut self, workspace: Entity<Workspace>, window: &Window, cx: &mut Context<Self>) {
+        workspace.update(cx, |workspace, cx| workspace.retain_session(window, cx));
         if self.is_workspace_retained(&workspace) {
             return;
         }
@@ -1332,6 +1345,7 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        workspace.update(cx, |workspace, cx| workspace.retain_session(window, cx));
         if self.workspace() == &workspace {
             self.focus_active_workspace(window, cx);
             return;
@@ -1366,7 +1380,7 @@ impl MultiWorkspace {
         self.held[displayed].activated_at = Some(stamp);
 
         if !should_retain_workspaces && !old_active_was_retained {
-            self.detach_workspace(&old_active_workspace, cx);
+            drop(self.detach_workspace(&old_active_workspace, window, cx));
         }
 
         // The platform window is shared across all workspaces in this window.
@@ -1407,7 +1421,7 @@ impl MultiWorkspace {
         let displayed_workspace = self.workspace().clone();
         for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
             if workspace != displayed_workspace {
-                self.detach_workspace(&workspace, cx);
+                drop(self.detach_workspace(&workspace, window, cx));
             }
         }
 
@@ -1421,7 +1435,12 @@ impl MultiWorkspace {
     /// Detaches a workspace: clears session state, DB binding, cached
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
-    fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+    fn detach_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Shared<Task<Result<(), Arc<anyhow::Error>>>> {
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(
                 index,
@@ -1429,12 +1448,47 @@ impl MultiWorkspace {
                 "the displayed workspace must be re-pointed before it is detached"
             );
             self.held.remove(index);
+        } else if let Some((_, task)) = self
+            .pending_removal_tasks
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == workspace.entity_id())
+        {
+            return task.clone();
         }
+        self.persistence_generation += 1;
         cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
-        let clear_session_binding =
-            workspace.update(cx, |workspace, cx| workspace.clear_session_binding(cx));
-        self.pending_removal_tasks.retain(|task| !task.is_ready());
-        self.pending_removal_tasks.push(clear_session_binding);
+        let discarded = workspace.update(cx, |workspace, _| workspace.take_discard_on_leave());
+        let leave_session = workspace.update(cx, |workspace, cx| {
+            workspace.leave_session(discarded, window, cx)
+        });
+        let workspace_id = workspace.entity_id();
+        let workspace = workspace.clone();
+        let task = cx
+            .spawn_in(window, async move |multi_workspace, cx| {
+                let result = leave_session.await;
+                if let Err(error) = &result {
+                    multi_workspace
+                        .update_in(cx, |multi_workspace, window, cx| {
+                            workspace.update(cx, |workspace, _| workspace.removing = false);
+                            multi_workspace.add(workspace, window, cx);
+                            multi_workspace.workspace().update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    format!("Could not close the project: {error:#}"),
+                                    cx,
+                                );
+                            });
+                        })
+                        .ok();
+                }
+                result.map_err(Arc::new)
+            })
+            .shared();
+        self.pending_removal_tasks
+            .retain(|(_, task)| task.clone().now_or_never().is_none());
+        self.pending_removal_tasks
+            .push((workspace_id, task.clone()));
+        task
     }
 
     fn sync_sidebar_to_workspace(&self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
@@ -1446,73 +1500,88 @@ impl MultiWorkspace {
         }
     }
 
+    pub fn begin_restoring_state(&mut self, state: MultiWorkspaceState) {
+        self.pending_restored_state = Some(state);
+    }
+
+    pub(crate) fn finish_restoring_state(&mut self, cx: &mut Context<Self>) {
+        self.pending_restored_state = None;
+        self.serialize(cx);
+    }
+
     pub fn serialize(&mut self, cx: &mut Context<Self>) {
+        self.persistence_generation += 1;
         self._serialize_task = Some(cx.spawn(async move |this, cx| {
             let Ok(task) = this.update(cx, |this, cx| this.serialize_now(cx)) else {
                 return;
             };
-            task.await;
+            task.await.log_err();
         }));
     }
 
-    fn serialize_now(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
+    fn serialize_now(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = Result<()>> + use<> {
         let active_workspace = self.workspace().read(cx);
         let session_id = active_workspace
             .session_id()
             .filter(|_| !active_workspace.is_remote_connection_placeholder());
-        let state = session_id.map(|session_id| {
-            let state = MultiWorkspaceState {
-                active_workspace_id: self.workspace().read(cx).database_id(),
-                project_groups: self
-                    .project_groups
-                    .iter()
-                    .map(|group| {
-                        crate::persistence::model::SerializedProjectGroup::from_group(
-                            &group.key,
-                            group.expanded,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                sidebar_open: self.sidebar_open,
-                sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
-            };
-            (session_id, state)
-        });
+        let live_state = MultiWorkspaceState {
+            active_workspace_id: active_workspace.database_id(),
+            project_groups: self
+                .project_groups
+                .iter()
+                .map(|group| {
+                    crate::persistence::model::SerializedProjectGroup::from_group(
+                        &group.key,
+                        group.expanded,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            sidebar_open: self.sidebar_open,
+            sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+        };
+        let state = match &self.pending_restored_state {
+            Some(restored_state) => restored_state.preserving_restored(live_state),
+            None => live_state,
+        };
         let window_id = self.window_id;
         let kvp = db::kvp::KeyValueStore::global(cx);
         async move {
-            if let Some((session_id, state)) = state {
+            if let Some(session_id) = session_id {
                 crate::persistence::write_multi_workspace_state(
                     &kvp,
                     &session_id,
                     window_id,
                     state,
                 )
-                .await;
+                .await?;
             }
+            Ok(())
         }
     }
 
     /// Used by the quit handler to ensure pending DB writes
     /// complete before the process exits.
-    pub fn flush_serialization(&mut self, cx: &mut Context<Self>) -> Task<()> {
+    pub fn flush_serialization(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         self._serialize_task.take();
         let serialization = self.serialize_now(cx);
-        cx.spawn(async move |_, _| serialization.await)
+        cx.background_spawn(serialization)
     }
 
     pub fn flush_pending_serialization(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<Task<()>> {
+    ) -> Vec<Task<Result<()>>> {
         let mut tasks = Vec::new();
         for workspace in self.workspaces() {
             tasks.push(workspace.update(cx, |workspace, cx| {
                 workspace.flush_serialization(window, cx)
             }));
         }
-        tasks.append(&mut self.take_pending_removal_tasks());
+        tasks.append(&mut self.pending_removal_tasks(cx));
         tasks.push(self.flush_serialization(cx));
         tasks
     }
@@ -1590,12 +1659,32 @@ impl MultiWorkspace {
         self.workspace().read(cx).database_id()
     }
 
-    pub fn take_pending_removal_tasks(&mut self) -> Vec<Task<()>> {
-        let tasks: Vec<Task<()>> = std::mem::take(&mut self.pending_removal_tasks)
-            .into_iter()
-            .filter(|task| !task.is_ready())
-            .collect();
-        tasks
+    pub(crate) fn persistence_state(&self, cx: &App) -> (u64, Vec<(EntityId, u64)>) {
+        (
+            self.persistence_generation,
+            self.workspaces()
+                .map(|workspace| {
+                    (
+                        workspace.entity_id(),
+                        workspace.read(cx).session.generation(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn pending_removal_tasks(&mut self, cx: &mut App) -> Vec<Task<Result<()>>> {
+        self.pending_removal_tasks
+            .retain(|(_, task)| task.clone().now_or_never().is_none());
+        self.pending_removal_tasks
+            .iter()
+            .map(|(_, task)| {
+                let task = task.clone();
+                cx.background_spawn(async move {
+                    task.await.map_err(|error| anyhow::anyhow!("{error:#}"))
+                })
+            })
+            .collect()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1733,7 +1822,12 @@ impl MultiWorkspace {
 
         let mut tasks: Vec<Task<()>> = Vec::new();
         for workspace in self.workspaces() {
-            tasks.push(workspace.update(cx, |ws, cx| ws.flush_serialization(window, cx)));
+            let flush = workspace.update(cx, |workspace, cx| {
+                workspace.flush_serialization(window, cx)
+            });
+            tasks.push(cx.background_spawn(async move {
+                flush.await.expect("failed to persist the test workspace");
+            }));
             if let Some(db_id) = workspace.read(cx).database_id() {
                 let db = crate::persistence::WorkspaceDb::global(cx);
                 let session_id = session_id.clone();
@@ -1744,7 +1838,10 @@ impl MultiWorkspace {
                 }));
             }
         }
-        tasks.push(self.flush_serialization(cx));
+        let flush = self.flush_serialization(cx);
+        tasks.push(cx.background_spawn(async move {
+            flush.await.expect("failed to persist the test window");
+        }));
         tasks
     }
 
@@ -1823,21 +1920,30 @@ impl MultiWorkspace {
         cx.spawn_in(window, async move |this, cx| {
             // Consent phase: run the standard close lifecycle for every
             // workspace being removed. Prompts only; no state changes.
+            let mut discarded = Vec::new();
             for workspace in &workspaces {
-                let should_continue = workspace
+                let prepared = workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.prepare_to_close(CloseIntent::ReplaceWindow, window, cx)
+                        workspace.prepare_to_close_keeping_session(
+                            CloseIntent::ReplaceWindow,
+                            window,
+                            cx,
+                        )
                     })?
                     .await?;
 
-                if !should_continue {
+                if !prepared.closed {
                     return Ok(false);
                 }
+                discarded.push(workspace.update(cx, |workspace, _| {
+                    workspace.set_discard_on_leave(prepared.discarded)
+                }));
             }
 
             // Edit phase: one synchronous update. Delete the rows, then pick
             // the replacement from the rows that actually remain.
-            let (removed_any, reopen_key) = this.update_in(cx, |this, window, cx| {
+            let (removed_any, reopen_key, removals) = this.update_in(cx, |this, window, cx| {
+                let mut removals = Vec::new();
                 let mut removed_any = false;
                 let displayed_workspace = this.workspace().clone();
 
@@ -1858,7 +1964,7 @@ impl MultiWorkspace {
                         continue;
                     }
                     if this.held_index(workspace).is_some() {
-                        this.detach_workspace(workspace, cx);
+                        removals.push(this.detach_workspace(workspace, window, cx));
                         removed_any = true;
                     }
                 }
@@ -1908,7 +2014,7 @@ impl MultiWorkspace {
                         });
 
                     this.activate(replacement, None, window, cx);
-                    this.detach_workspace(&displayed_workspace, cx);
+                    removals.push(this.detach_workspace(&displayed_workspace, window, cx));
                     removed_any = true;
                 } else if *this.workspace() != original_active
                     && !workspaces.contains(&original_active)
@@ -1923,14 +2029,19 @@ impl MultiWorkspace {
                     cx.notify();
                 }
 
-                (removed_any, reopen_key)
+                (removed_any, reopen_key, removals)
             })?;
+            for result in futures::future::join_all(removals).await {
+                result.map_err(|error| anyhow::anyhow!("{error:#}"))?;
+            }
+            drop(discarded);
 
             if let Some(key) = reopen_key {
                 this.update_in(cx, |this, window, cx| {
                     this.find_or_create_local_workspace(
                         key.path_list().clone(),
                         Some(key),
+                        None,
                         None,
                         OpenMode::Activate,
                         None,
@@ -1968,20 +2079,27 @@ impl MultiWorkspace {
             };
 
             cx.spawn_in(window, async move |this, cx| {
+                let mut discarded = DiscardedItems::default();
                 if let Some(empty_workspace) = empty_workspace.as_ref() {
-                    let should_continue = empty_workspace
+                    let prepared = empty_workspace
                         .update_in(cx, |workspace, window, cx| {
-                            workspace.prepare_to_close(CloseIntent::ReplaceWindow, window, cx)
+                            workspace.prepare_to_close_keeping_session(
+                                CloseIntent::ReplaceWindow,
+                                window,
+                                cx,
+                            )
                         })?
                         .await?;
-                    if !should_continue {
+                    if !prepared.closed {
                         return Ok(empty_workspace.clone());
                     }
+                    discarded = prepared.discarded;
                 }
 
                 let create_task = this.update_in(cx, |this, window, cx| {
                     this.find_or_create_local_workspace(
                         PathList::new(&paths),
+                        None,
                         None,
                         None,
                         OpenMode::Activate,
@@ -1995,32 +2113,60 @@ impl MultiWorkspace {
                 if let Some(empty_workspace) = empty_workspace
                     && empty_workspace != new_workspace
                 {
-                    this.update(cx, |this, cx| {
-                        if this.is_workspace_retained(&empty_workspace) {
-                            this.detach_workspace(&empty_workspace, cx);
-                        }
+                    let removal = this.update_in(cx, |multi_workspace, window, cx| {
+                        let _discarded = empty_workspace
+                            .update(cx, |workspace, _| workspace.set_discard_on_leave(discarded));
+                        multi_workspace.detach_workspace(&empty_workspace, window, cx)
                     })?;
+                    removal
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
                 }
 
                 Ok(new_workspace)
             })
         } else {
             let workspace = self.workspace().clone();
-            cx.spawn_in(window, async move |_this, cx| {
-                let should_continue = workspace
+            cx.spawn_in(window, async move |multi_workspace, cx| {
+                let prepared = workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.prepare_to_close(crate::CloseIntent::ReplaceWindow, window, cx)
+                        workspace.prepare_to_close_keeping_session(
+                            CloseIntent::ReplaceWindow,
+                            window,
+                            cx,
+                        )
                     })?
                     .await?;
-                if should_continue {
-                    workspace
-                        .update_in(cx, |workspace, window, cx| {
-                            workspace.open_workspace_for_paths(open_mode, paths, window, cx)
-                        })?
-                        .await
-                } else {
-                    Ok(workspace)
+                if !prepared.closed {
+                    return Ok(workspace);
                 }
+                let _discard_on_leave = workspace.update(cx, |workspace, _| {
+                    workspace.set_discard_on_leave(prepared.discarded)
+                });
+                let opened = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.open_workspace_for_paths(open_mode, paths, window, cx)
+                    })?
+                    .await;
+                if opened.as_ref().is_ok_and(|opened| *opened != workspace) {
+                    let removal = multi_workspace.read_with(cx, |multi_workspace, _| {
+                        if multi_workspace.held_index(&workspace).is_some() {
+                            return None;
+                        }
+                        multi_workspace
+                            .pending_removal_tasks
+                            .iter()
+                            .rev()
+                            .find(|(id, _)| *id == workspace.entity_id())
+                            .map(|(_, task)| task.clone())
+                    })?;
+                    if let Some(removal) = removal {
+                        removal
+                            .await
+                            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                    }
+                }
+                opened
             })
         }
     }

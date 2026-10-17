@@ -3,24 +3,29 @@ use futures::{FutureExt, StreamExt as _, channel::mpsc, future::Shared};
 use language::Buffer;
 use remote::RemoteClient;
 use rpc::proto::{self, REMOTE_SERVER_PROJECT_ID};
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    path::Path,
+    rc::{Rc, Weak},
+    sync::Arc,
+};
 use task::{Shell, shell_to_proto};
 use util::{ResultExt, command::new_command};
-use worktree::Worktree;
+use worktree::{Worktree, WorktreeId};
 
 use collections::HashMap;
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task, WeakEntity};
 use settings::Settings as _;
 
 use crate::{
     project_settings::{DirenvSettings, ProjectSettings},
-    worktree_store::WorktreeStore,
+    worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
 
 pub struct ProjectEnvironment {
-    this: WeakEntity<Self>,
     cli_environment: Option<HashMap<String, String>>,
-    cli_environment_gate: Option<Shared<Task<()>>>,
+    worktree_cli_environments: HashMap<WorktreeId, HashMap<String, String>>,
+    requested_cli_environments: Vec<RequestedCliEnvironment>,
     local_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     remote_environments: HashMap<(Shell, Arc<Path>), Shared<Task<Option<HashMap<String, String>>>>>,
     environment_error_messages: VecDeque<String>,
@@ -29,10 +34,22 @@ pub struct ProjectEnvironment {
     remote_client: Option<WeakEntity<RemoteClient>>,
     is_remote_project: bool,
     _tasks: Vec<Task<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub enum ProjectEnvironmentEvent {
     ErrorsUpdated,
+}
+
+#[must_use]
+pub struct CliEnvironmentRequest {
+    _request: Rc<()>,
+}
+
+struct RequestedCliEnvironment {
+    root: Arc<Path>,
+    environment: HashMap<String, String>,
+    request: Weak<()>,
 }
 
 impl EventEmitter<ProjectEnvironmentEvent> for ProjectEnvironment {}
@@ -55,10 +72,15 @@ impl ProjectEnvironment {
                 .ok();
             }
         });
+        let _subscriptions = worktree_store
+            .upgrade()
+            .map(|worktree_store| cx.subscribe(&worktree_store, Self::on_worktree_store_event))
+            .into_iter()
+            .collect();
         Self {
-            this: cx.weak_entity(),
             cli_environment,
-            cli_environment_gate: None,
+            worktree_cli_environments: HashMap::default(),
+            requested_cli_environments: Vec::new(),
             local_environments: Default::default(),
             remote_environments: Default::default(),
             environment_error_messages: Default::default(),
@@ -67,68 +89,124 @@ impl ProjectEnvironment {
             remote_client,
             is_remote_project,
             _tasks: vec![task],
+            _subscriptions,
+        }
+    }
+
+    pub fn set_cli_environment_for_worktree(
+        &mut self,
+        worktree_id: WorktreeId,
+        environment: &HashMap<String, String>,
+    ) {
+        if self.worktree_cli_environments.get(&worktree_id) != Some(environment) {
+            self.worktree_cli_environments
+                .insert(worktree_id, environment.clone());
         }
     }
 
     /// Returns the inherited CLI environment, if this project was opened from the Zed CLI.
     pub(crate) fn get_cli_environment(&self) -> Option<HashMap<String, String>> {
-        if cfg!(any(test, feature = "test-support")) {
-            return Some(self.cli_environment.clone().unwrap_or_default());
-        }
-        if let Some(mut env) = self.cli_environment.clone() {
-            set_origin_marker(&mut env, EnvironmentOrigin::Cli);
-            Some(env)
-        } else {
-            None
-        }
+        self.cli_environment_for_worktree(None)
     }
 
-    pub(crate) fn set_cli_environment_if_unset(
+    pub fn request_cli_environment_for_roots(
         &mut self,
-        cli_environment: HashMap<String, String>,
-    ) {
-        if self.accepts_cli_environment() {
-            self.cli_environment = Some(cli_environment);
+        roots: impl IntoIterator<Item = Arc<Path>>,
+        environment: HashMap<String, String>,
+    ) -> CliEnvironmentRequest {
+        let request = Rc::new(());
+        self.requested_cli_environments
+            .retain(|requested| requested.request.strong_count() > 0);
+        for root in roots {
+            self.requested_cli_environments
+                .push(RequestedCliEnvironment {
+                    root,
+                    environment: environment.clone(),
+                    request: Rc::downgrade(&request),
+                });
         }
+        CliEnvironmentRequest { _request: request }
     }
 
-    pub(crate) fn set_cli_environment_gate(
+    fn on_worktree_store_event(
         &mut self,
-        gate: impl Future<Output = ()> + 'static,
+        _: Entity<WorktreeStore>,
+        event: &WorktreeStoreEvent,
         cx: &mut Context<Self>,
     ) {
-        if self.accepts_cli_environment() {
-            self.cli_environment_gate = Some(cx.spawn(async move |_, _| gate.await).shared());
+        match event {
+            WorktreeStoreEvent::WorktreeAdded(worktree) => {
+                let worktree = worktree.read(cx);
+                if let Some(environment) = self.requested_cli_environment(&worktree.abs_path()) {
+                    self.worktree_cli_environments
+                        .insert(worktree.id(), environment.clone());
+                }
+            }
+            WorktreeStoreEvent::WorktreeRemoved(_, worktree_id) => {
+                self.worktree_cli_environments.remove(worktree_id);
+            }
+            _ => {}
         }
     }
 
-    fn accepts_cli_environment(&self) -> bool {
-        self.cli_environment.is_none() && !self.is_remote_project && self.remote_client.is_none()
+    fn requested_cli_environment(&self, root: &Path) -> Option<&HashMap<String, String>> {
+        self.requested_cli_environments
+            .iter()
+            .rev()
+            .find(|requested| requested.request.strong_count() > 0 && *requested.root == *root)
+            .map(|requested| &requested.environment)
     }
 
-    fn gated_environment(
-        &mut self,
-        cx: &mut App,
-        environment: impl FnOnce(
-            &mut Self,
-            &mut Context<Self>,
-        ) -> Shared<Task<Option<HashMap<String, String>>>>
-        + 'static,
-    ) -> Option<Shared<Task<Option<HashMap<String, String>>>>> {
-        let gate = self.cli_environment_gate.clone()?;
-        if gate.clone().now_or_never().is_some() {
-            self.cli_environment_gate = None;
-            return None;
+    pub(crate) fn cli_environment_for_worktree(
+        &self,
+        worktree: Option<&Worktree>,
+    ) -> Option<HashMap<String, String>> {
+        let worktree_environment = worktree.and_then(|worktree| {
+            self.worktree_cli_environments
+                .get(&worktree.id())
+                .or_else(|| self.requested_cli_environment(&worktree.abs_path()))
+        });
+        let mut env = match worktree_environment.or(self.cli_environment.as_ref()) {
+            Some(env) => env.clone(),
+            None if cfg!(any(test, feature = "test-support")) => return Some(HashMap::default()),
+            None => return None,
+        };
+        set_origin_marker(&mut env, EnvironmentOrigin::Cli);
+        Some(env)
+    }
+
+    fn cli_environment_for_path(
+        &self,
+        abs_path: &Path,
+        cx: &App,
+    ) -> Option<HashMap<String, String>> {
+        let worktree_store = self.worktree_store.upgrade();
+        let containing_worktree = worktree_store.as_ref().and_then(|worktree_store| {
+            worktree_store
+                .read(cx)
+                .worktrees()
+                .filter(|worktree| abs_path.starts_with(worktree.read(cx).abs_path()))
+                .max_by_key(|worktree| worktree.read(cx).abs_path().components().count())
+        });
+        if let Some(worktree) = containing_worktree {
+            return self.cli_environment_for_worktree(Some(worktree.read(cx)));
         }
-        let this = self.this.clone();
-        Some(
-            cx.spawn(async move |cx| {
-                gate.await;
-                let environment = this.update(cx, |this, cx| environment(this, cx)).ok()?;
-                environment.await
-            })
-            .shared(),
-        )
+        if let Some(worktree_store) = worktree_store {
+            let mut environments = worktree_store
+                .read(cx)
+                .visible_worktrees(cx)
+                .filter(|worktree| {
+                    let worktree = worktree.read(cx);
+                    worktree.is_single_file() && worktree.abs_path().parent() == Some(abs_path)
+                })
+                .map(|worktree| self.cli_environment_for_worktree(Some(worktree.read(cx))));
+            if let Some(environment) = environments.next()
+                && environments.all(|candidate| candidate == environment)
+            {
+                return environment;
+            }
+        }
+        self.cli_environment_for_worktree(None)
     }
 
     pub fn buffer_environment(
@@ -137,26 +215,13 @@ impl ProjectEnvironment {
         worktree_store: &Entity<WorktreeStore>,
         cx: &mut Context<Self>,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        let gated = self.gated_environment(cx, {
-            let buffer = buffer.clone();
-            let worktree_store = worktree_store.clone();
-            move |this, cx| this.buffer_environment(&buffer, &worktree_store, cx)
-        });
-        if let Some(gated) = gated {
-            return gated;
-        }
-        if let Some(cli_environment) = self.get_cli_environment() {
-            log::debug!("using project environment variables from CLI");
-            return Task::ready(Some(cli_environment)).shared();
-        }
-
         let Some(worktree) = buffer
             .read(cx)
             .file()
             .map(|f| f.worktree_id(cx))
             .and_then(|worktree_id| worktree_store.read(cx).worktree_for_id(worktree_id, cx))
         else {
-            return Task::ready(None).shared();
+            return Task::ready(self.get_cli_environment()).shared();
         };
         self.worktree_environment(worktree, cx)
     }
@@ -166,20 +231,12 @@ impl ProjectEnvironment {
         worktree: Entity<Worktree>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        let gated = self.gated_environment(cx, {
-            let worktree = worktree.clone();
-            move |this, cx| this.worktree_environment(worktree, cx)
-        });
-        if let Some(gated) = gated {
-            return gated;
-        }
-        if let Some(cli_environment) = self.get_cli_environment() {
+        let worktree = worktree.read(cx);
+        let mut abs_path = worktree.abs_path();
+        if let Some(cli_environment) = self.cli_environment_for_worktree(Some(worktree)) {
             log::debug!("using project environment variables from CLI");
             return Task::ready(Some(cli_environment)).shared();
         }
-
-        let worktree = worktree.read(cx);
-        let mut abs_path = worktree.abs_path();
         if worktree.is_single_file() {
             let Some(parent) = abs_path.parent() else {
                 return Task::ready(None).shared();
@@ -241,17 +298,32 @@ impl ProjectEnvironment {
         &mut self,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        let abs_path = self
+        let worktree = self
             .worktree_store
             .read_with(cx, |worktree_store, cx| {
-                crate::Project::default_visible_worktree_paths(worktree_store, cx)
-                    .into_iter()
-                    .next()
+                worktree_store
+                    .visible_worktrees(cx)
+                    .find(|worktree| !worktree.read(cx).is_single_file())
+                    .or_else(|| worktree_store.visible_worktrees(cx).next())
             })
             .ok()
-            .flatten()
-            .map(|path| Arc::<Path>::from(path))
-            .unwrap_or_else(|| paths::home_dir().as_path().into());
+            .flatten();
+        if let Some(environment) =
+            self.cli_environment_for_worktree(worktree.as_ref().map(|worktree| worktree.read(cx)))
+        {
+            return Task::ready(Some(environment)).shared();
+        }
+        let abs_path = worktree
+            .and_then(|worktree| {
+                let worktree = worktree.read(cx);
+                let path = worktree.abs_path();
+                if worktree.is_single_file() {
+                    path.parent().map(Arc::<Path>::from)
+                } else {
+                    Some(path)
+                }
+            })
+            .unwrap_or_else(|| Arc::from(paths::home_dir().as_path()));
         self.local_directory_environment(&Shell::System, abs_path, cx)
     }
 
@@ -265,15 +337,7 @@ impl ProjectEnvironment {
         abs_path: Arc<Path>,
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
-        let gated = self.gated_environment(cx, {
-            let shell = shell.clone();
-            let abs_path = abs_path.clone();
-            move |this, cx| this.local_directory_environment(&shell, abs_path, cx)
-        });
-        if let Some(gated) = gated {
-            return gated;
-        }
-        if let Some(cli_environment) = self.get_cli_environment() {
+        if let Some(cli_environment) = self.cli_environment_for_path(&abs_path, cx) {
             log::debug!("using project environment variables from CLI");
             return Task::ready(Some(cli_environment)).shared();
         }

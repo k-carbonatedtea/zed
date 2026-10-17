@@ -17,6 +17,7 @@ message Breakpoint {
   optional string condition = 5;
   optional string hit_condition = 6;
   map<uint64, BreakpointSessionState> session_state = 7;
+  optional uint64 id = 8;
 }
 
 message BreakpointSessionState {
@@ -28,12 +29,27 @@ message BreakpointsForFile {
   uint64 project_id = 1;
   string path = 2;
   repeated Breakpoint breakpoints = 3;
+  uint64 version = 4;
 }
 
 message ToggleBreakpoint {
   uint64 project_id = 1;
   string path = 2;
   Breakpoint breakpoint = 3;
+  BreakpointEdit edit = 4;
+  repeated Breakpoint additional_breakpoints = 5;
+}
+
+message ToggleBreakpointResponse {
+  uint64 version = 1;
+  uint64 processed_breakpoints = 2;
+}
+
+enum BreakpointEdit {
+  Toggle = 0;
+  Set = 1;
+  Remove = 2;
+  Superseded = 3;
 }
 
 enum DapThreadStatus {

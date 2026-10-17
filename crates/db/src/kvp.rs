@@ -5,7 +5,7 @@ use util::ResultExt as _;
 
 use crate::{
     query,
-    sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
+    sqlez::{connection::Connection, domain::Domain, thread_safe_connection::ThreadSafeConnection},
     write_and_log,
 };
 
@@ -86,22 +86,6 @@ impl KeyValueStore {
         }
     }
 
-    pub async fn write_kvps(&self, pairs: Vec<(String, String)>) -> anyhow::Result<()> {
-        self.write(move |connection| {
-            connection.with_savepoint("write_kvps", || {
-                let mut insert = connection.exec_bound::<(&str, &str)>(
-                    "INSERT OR REPLACE INTO kv_store(key, value) VALUES ((?), (?))",
-                )?;
-                for (key, value) in &pairs {
-                    insert((key, value))?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .context("Failed to write key-value pairs")
-    }
-
     pub async fn next_counter_value(&self, key: String, max: u32) -> anyhow::Result<u32> {
         self.write(move |connection| {
             connection
@@ -125,28 +109,23 @@ impl KeyValueStore {
     }
 }
 
-pub fn write_value(
-    connection: &crate::sqlez::connection::Connection,
-    key: &str,
-    value: &str,
-) -> anyhow::Result<()> {
-    if !table_exists(connection, "kv_store")? {
-        return Ok(());
-    }
+pub fn write_value(connection: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
     connection.exec_bound::<(&str, &str)>(
         "INSERT OR REPLACE INTO kv_store(key, value) VALUES ((?), (?))",
     )?((key, value))
     .context("Failed to write to kv_store")
 }
 
+pub fn read_value(connection: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+    connection.select_row_bound::<&str, String>("SELECT value FROM kv_store WHERE key = (?)")?(key)
+        .context("Failed to read from kv_store")
+}
+
 pub fn read_scoped_value(
-    connection: &crate::sqlez::connection::Connection,
+    connection: &Connection,
     namespace: &str,
     key: &str,
 ) -> anyhow::Result<Option<String>> {
-    if !scoped_store_exists(connection)? {
-        return Ok(None);
-    }
     connection.select_row_bound::<(&str, &str), String>(
         "SELECT value FROM scoped_kv_store WHERE namespace = (?) AND key = (?)",
     )?((namespace, key))
@@ -154,14 +133,11 @@ pub fn read_scoped_value(
 }
 
 pub fn insert_scoped_value_if_absent(
-    connection: &crate::sqlez::connection::Connection,
+    connection: &Connection,
     namespace: &str,
     key: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    if !scoped_store_exists(connection)? {
-        return Ok(());
-    }
     connection.exec_bound::<(&str, &str, &str)>(
         "INSERT OR IGNORE INTO scoped_kv_store(namespace, key, value) VALUES ((?), (?), (?))",
     )?((namespace, key, value))
@@ -169,7 +145,7 @@ pub fn insert_scoped_value_if_absent(
 }
 
 pub fn write_scoped_value(
-    connection: &crate::sqlez::connection::Connection,
+    connection: &Connection,
     namespace: &str,
     key: &str,
     value: &str,
@@ -181,12 +157,9 @@ pub fn write_scoped_value(
 }
 
 pub fn read_scoped_values(
-    connection: &crate::sqlez::connection::Connection,
+    connection: &Connection,
     namespace: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    if !scoped_store_exists(connection)? {
-        return Ok(Vec::new());
-    }
     connection.select_bound::<&str, (String, String)>(
         "SELECT key, value FROM scoped_kv_store WHERE namespace = (?)",
     )?(namespace)
@@ -194,31 +167,14 @@ pub fn read_scoped_values(
 }
 
 pub fn delete_scoped_value(
-    connection: &crate::sqlez::connection::Connection,
+    connection: &Connection,
     namespace: &str,
     key: &str,
 ) -> anyhow::Result<()> {
-    if !scoped_store_exists(connection)? {
-        return Ok(());
-    }
     connection.exec_bound::<(&str, &str)>(
         "DELETE FROM scoped_kv_store WHERE namespace = (?) AND key = (?)",
     )?((namespace, key))
     .context("Failed to delete from scoped_kv_store")
-}
-
-fn scoped_store_exists(connection: &crate::sqlez::connection::Connection) -> anyhow::Result<bool> {
-    table_exists(connection, "scoped_kv_store")
-}
-
-fn table_exists(
-    connection: &crate::sqlez::connection::Connection,
-    table: &str,
-) -> anyhow::Result<bool> {
-    Ok(connection.select_row_bound::<&str, bool>(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = (?)",
-    )?(table)?
-    .is_some())
 }
 
 pub struct ScopedKeyValueStore<'a> {

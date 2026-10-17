@@ -10,8 +10,8 @@ use db::kvp::KeyValueStore;
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Render, SharedString, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
+    deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -29,6 +29,7 @@ pub enum PanelEvent {
     ZoomOut,
     Activate,
     Close,
+    PersistenceChanged,
 }
 
 pub use proto::PanelId;
@@ -101,6 +102,13 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn hide_button_setting(&self, _: &App) -> Option<HideStatusItem> {
         None
     }
+    fn flush_serialization(
+        &mut self,
+        _workspace: &Workspace,
+        _cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        Task::ready(Ok(()))
+    }
 }
 
 pub trait PanelHandle: Send + Sync {
@@ -134,6 +142,7 @@ pub trait PanelHandle: Send + Sync {
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
+    fn flush_serialization(&self, workspace: &Workspace, cx: &mut App) -> Task<anyhow::Result<()>>;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
         let next_position = [
@@ -269,6 +278,10 @@ where
 
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem> {
         self.read(cx).hide_button_setting(cx)
+    }
+
+    fn flush_serialization(&self, workspace: &Workspace, cx: &mut App) -> Task<anyhow::Result<()>> {
+        self.update(cx, |this, cx| this.flush_serialization(workspace, cx))
     }
 }
 
@@ -516,6 +529,13 @@ impl Dock {
 
     fn resizable(&self, cx: &App) -> bool {
         !(self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
+    }
+
+    pub(crate) fn panel_handles(&self) -> Vec<Arc<dyn PanelHandle>> {
+        self.panel_entries
+            .iter()
+            .map(|entry| entry.panel.clone())
+            .collect()
     }
 
     pub fn panel<T: Panel>(&self) -> Option<Entity<T>> {
@@ -776,6 +796,11 @@ impl Dock {
                         {
                             this.set_open(false, window, cx);
                         }
+                    }
+                    PanelEvent::PersistenceChanged => {
+                        workspace
+                            .update(cx, |workspace, _| workspace.invalidate_persistence())
+                            .ok();
                     }
                 },
             ),
@@ -1257,10 +1282,7 @@ impl Dock {
         panel_key: &'static str,
         cx: &App,
     ) -> Option<PanelSizeState> {
-        let workspace_id = workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())?;
+        let workspace_id = workspace.serialization_scope()?;
         let kvp = KeyValueStore::global(cx);
         let scope = kvp.scoped(PANEL_SIZE_STATE_KEY);
         scope
@@ -1619,6 +1641,7 @@ pub mod test {
         pub default_size: Pixels,
         pub flexible: bool,
         pub activation_priority: u32,
+        pub pending_serialization: Option<Task<anyhow::Result<()>>>,
     }
     actions!(test_only, [ToggleTestPanel]);
 
@@ -1635,6 +1658,7 @@ pub mod test {
                 default_size: px(300.),
                 flexible: false,
                 activation_priority,
+                pending_serialization: None,
             }
         }
 
@@ -1673,6 +1697,16 @@ pub mod test {
     }
 
     impl Panel for TestPanel {
+        fn flush_serialization(
+            &mut self,
+            _: &Workspace,
+            _: &mut Context<Self>,
+        ) -> Task<anyhow::Result<()>> {
+            self.pending_serialization
+                .take()
+                .unwrap_or_else(|| Task::ready(Ok(())))
+        }
+
         fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
             self.activation_focus_handle
                 .clone()

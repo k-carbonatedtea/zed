@@ -48,7 +48,7 @@ use pretty_assertions::{assert_eq, assert_ne};
 use project::{
     FakeFs, Project, ProjectPath,
     bookmark_store::{BookmarkStore, BookmarkStoreEvent, SerializedBookmark},
-    debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
+    debugger::breakpoint_store::{BreakpointState, BreakpointStoreEvent, SourceBreakpoint},
     lsp_store::lsp_ext_command::{DocsUrls, LspOpenDocs},
     project_settings::LspSettings,
     trusted_worktrees::{PathTrust, TrustedWorktrees},
@@ -36493,28 +36493,29 @@ fn add_log_breakpoint_at_cursor(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    let (anchor, bp) = editor
+    let existing = editor
         .breakpoints_at_cursors(window, cx)
-        .first()
-        .and_then(|(anchor, bp)| bp.as_ref().map(|bp| (*anchor, bp.clone())))
-        .unwrap_or_else(|| {
+        .into_iter()
+        .next()
+        .and_then(|(_, breakpoints)| breakpoints.into_iter().next());
+    let edit_action = BreakpointEditAction::EditLogMessage(log_message.into());
+    match existing {
+        Some((_, breakpoint)) => editor.edit_breakpoint(breakpoint, edit_action, cx),
+        None => {
             let snapshot = editor.snapshot(window, cx);
             let cursor_position: Point =
                 editor.selections.newest(&snapshot.display_snapshot).head();
-
             let breakpoint_position = snapshot
                 .buffer_snapshot()
                 .anchor_before(Point::new(cursor_position.row, 0));
-
-            (breakpoint_position, Breakpoint::new_log(log_message))
-        });
-
-    editor.edit_breakpoint_at_anchor(
-        anchor,
-        bp,
-        BreakpointEditAction::EditLogMessage(log_message.into()),
-        cx,
-    );
+            editor.edit_breakpoint_at_anchor(
+                breakpoint_position,
+                Breakpoint::new_log(log_message),
+                edit_action,
+                cx,
+            );
+        }
+    }
 }
 
 #[gpui::test]
@@ -36724,136 +36725,384 @@ async fn test_breakpoint_toggling(cx: &mut TestAppContext) {
 async fn test_restoring_breakpoints_keeps_breakpoints_set_meanwhile(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
+    let text = "First line\nSecond line\nThird line\nFourth line";
     let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        path!("/a"),
-        json!({ "main.rs": "First line\nSecond line\nThird line\nFourth line" }),
-    )
-    .await;
+    fs.insert_tree(path!("/a"), json!({ "main.rs": text, "replaced.rs": text }))
+        .await;
     let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let cx = &mut VisualTestContext::from_window(*window, cx);
+    let main_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/a/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let opened_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/a/replaced.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let file = opened_buffer.read_with(cx, |buffer, _| buffer.file().cloned().unwrap());
+    let replacement_buffer = cx.new(|cx| {
+        let mut buffer = language::Buffer::local("First line\nSecond line\nThird line", cx);
+        buffer.file_updated(file, cx);
+        buffer
+    });
+    let main_path = Arc::<Path>::from(Path::new(path!("/a/main.rs")));
+    let replaced_path = Arc::<Path>::from(Path::new(path!("/a/replaced.rs")));
+    let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+    breakpoint_store.update(cx, |store, cx| {
+        for (buffer, row) in [(main_buffer, 0), (replacement_buffer, 1)] {
+            let position = buffer.read(cx).snapshot().anchor_after(Point::new(row, 0));
+            store.toggle_breakpoint(
+                buffer,
+                BreakpointWithPosition::new(position, Breakpoint::new_standard()),
+                BreakpointEditAction::Toggle,
+                cx,
+            );
+        }
+    });
+
+    let updated_paths = Rc::new(RefCell::new(Vec::new()));
+    let _updates = cx.update(|cx| {
+        let updated_paths = updated_paths.clone();
+        cx.subscribe(&breakpoint_store, move |_, event, _| {
+            if let BreakpointStoreEvent::BreakpointsUpdated(path, _) = event {
+                updated_paths.borrow_mut().push(path.clone());
+            }
+        })
+    });
+    breakpoint_store
+        .update(cx, |store, cx| {
+            store.with_serialized_breakpoints(
+                BTreeMap::from(
+                    [(&main_path, vec![3]), (&replaced_path, vec![1, 2, 3])].map(|(path, rows)| {
+                        let breakpoints = rows
+                            .into_iter()
+                            .map(|row| SourceBreakpoint {
+                                row,
+                                path: path.clone(),
+                                message: None,
+                                condition: None,
+                                hit_condition: None,
+                                state: BreakpointState::Enabled,
+                            })
+                            .collect();
+                        (path.clone(), breakpoints)
+                    }),
+                ),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    let breakpoints = breakpoint_store.read_with(cx, |store, cx| store.all_source_breakpoints(cx));
+    assert_breakpoint(
+        &breakpoints,
+        &main_path,
+        vec![
+            (0, Breakpoint::new_standard()),
+            (3, Breakpoint::new_standard()),
+        ],
+    );
+    assert_breakpoint(
+        &breakpoints,
+        &replaced_path,
+        vec![
+            (1, Breakpoint::new_standard()),
+            (2, Breakpoint::new_standard()),
+        ],
+    );
+    assert_eq!(*updated_paths.borrow(), vec![main_path, replaced_path]);
+}
+
+#[gpui::test]
+async fn test_renaming_and_deleting_files_report_their_breakpoints(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/a"), json!({ "main.rs": "First line\nSecond line" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let buffer = project
         .update(cx, |project, cx| {
             project.open_local_buffer(path!("/a/main.rs"), cx)
         })
         .await
         .unwrap();
-    let (editor, cx) = cx.add_window_view(|window, cx| {
-        Editor::new(
-            EditorMode::full(),
-            MultiBuffer::build_from_buffer(buffer, cx),
-            Some(project.clone()),
-            window,
+    let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+    breakpoint_store.update(cx, |store, cx| {
+        let position = buffer.read(cx).snapshot().anchor_after(Point::new(1, 0));
+        store.toggle_breakpoint(
+            buffer.clone(),
+            BreakpointWithPosition::new(position, Breakpoint::new_standard()),
+            BreakpointEditAction::Toggle,
             cx,
-        )
+        );
     });
-    let abs_path = Arc::<Path>::from(Path::new(path!("/a/main.rs")));
-    editor.update_in(cx, |editor, window, cx| {
-        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let _events = cx.update(|cx| {
+        let events = events.clone();
+        cx.subscribe(&breakpoint_store, move |_, event, _| match event {
+            BreakpointStoreEvent::BreakpointsUpdated(path, _) => {
+                events.borrow_mut().push(("updated", vec![path.clone()]))
+            }
+            BreakpointStoreEvent::BreakpointsCleared(paths) => {
+                events.borrow_mut().push(("cleared", paths.clone()))
+            }
+            BreakpointStoreEvent::SetDebugLine | BreakpointStoreEvent::ClearDebugLines => {}
+        })
     });
 
-    let breakpoint_store = editor.read_with(cx, |editor, _| editor.breakpoint_store().unwrap());
-    breakpoint_store
-        .update(cx, |store, cx| {
-            store.with_serialized_breakpoints(
-                BTreeMap::from([(
-                    abs_path.clone(),
-                    vec![SourceBreakpoint {
-                        row: 3,
-                        path: abs_path.clone(),
-                        message: None,
-                        condition: None,
-                        hit_condition: None,
-                        state: BreakpointState::Enabled,
-                    }],
-                )]),
-                cx,
-            )
-        })
+    fs.rename(
+        Path::new(path!("/a/main.rs")),
+        Path::new(path!("/a/renamed.rs")),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+    fs.remove_file(Path::new(path!("/a/renamed.rs")), Default::default())
         .await
         .unwrap();
+    cx.run_until_parked();
 
-    let breakpoints = breakpoint_store.read_with(cx, |store, cx| store.all_source_breakpoints(cx));
-    assert_breakpoint(
-        &breakpoints,
-        &abs_path,
+    let main_path = Arc::<Path>::from(Path::new(path!("/a/main.rs")));
+    let renamed_path = Arc::<Path>::from(Path::new(path!("/a/renamed.rs")));
+    assert_eq!(
+        *events.borrow(),
         vec![
-            (0, Breakpoint::new_standard()),
-            (3, Breakpoint::new_standard()),
-        ],
+            ("cleared", vec![main_path]),
+            ("updated", vec![renamed_path.clone()]),
+            ("cleared", vec![renamed_path]),
+        ]
     );
 }
 
 #[gpui::test]
-async fn test_restoring_breakpoints_into_a_replaced_buffer_of_the_same_path(
-    cx: &mut TestAppContext,
-) {
+async fn test_breakpoints_removed_while_restoring_stay_removed(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let text = "First line\nSecond line\nThird line\nFourth line";
     let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(path!("/a"), json!({ "main.rs": text }))
+    fs.insert_tree(path!("/a"), json!({ "main.rs": text, "other.rs": text }))
         .await;
     let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
-    let opened_buffer = project
+    let main_buffer = project
         .update(cx, |project, cx| {
             project.open_local_buffer(path!("/a/main.rs"), cx)
         })
         .await
         .unwrap();
-    let file = opened_buffer.read_with(cx, |buffer, _| buffer.file().cloned().unwrap());
-    let replacement_buffer = cx.new(|cx| {
-        let mut buffer = language::Buffer::local(text, cx);
-        buffer.file_updated(file, cx);
-        buffer
-    });
-    let abs_path = Arc::<Path>::from(Path::new(path!("/a/main.rs")));
+    let main_path = Arc::<Path>::from(Path::new(path!("/a/main.rs")));
+    let other_path = Arc::<Path>::from(Path::new(path!("/a/other.rs")));
+    let source_breakpoints = |path: &Arc<Path>, rows: &[u32]| {
+        rows.iter()
+            .map(|row| SourceBreakpoint {
+                row: *row,
+                path: path.clone(),
+                message: None,
+                condition: None,
+                hit_condition: None,
+                state: BreakpointState::Enabled,
+            })
+            .collect::<Vec<_>>()
+    };
+    let persisted_rows = |cx: &mut TestAppContext| {
+        project.read_with(cx, |project, cx| {
+            project
+                .breakpoint_store()
+                .read(cx)
+                .source_breakpoints_to_persist(cx)
+                .into_iter()
+                .map(|(path, breakpoints)| {
+                    let mut rows = breakpoints
+                        .iter()
+                        .map(|breakpoint| breakpoint.row)
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    (path, rows)
+                })
+                .filter(|(_, rows)| !rows.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
     let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+    let saved = BTreeMap::from([
+        (main_path.clone(), source_breakpoints(&main_path, &[1, 2])),
+        (other_path.clone(), source_breakpoints(&other_path, &[0])),
+    ]);
+
+    breakpoint_store.update(cx, |store, _| store.begin_restoring(saved.clone()));
+    let while_restoring = persisted_rows(cx);
     breakpoint_store.update(cx, |store, cx| {
-        let position = replacement_buffer
-            .read(cx)
-            .snapshot()
-            .anchor_after(Point::new(1, 0));
-        store.toggle_breakpoint(
-            replacement_buffer.clone(),
-            BreakpointWithPosition {
-                position,
-                bp: Breakpoint::new_standard(),
-            },
-            BreakpointEditAction::Toggle,
-            cx,
-        );
+        for _ in 0..2 {
+            let position = main_buffer
+                .read(cx)
+                .snapshot()
+                .anchor_after(Point::new(1, 0));
+            store.toggle_breakpoint(
+                main_buffer.clone(),
+                BreakpointWithPosition::new(position, Breakpoint::new_standard()),
+                BreakpointEditAction::Toggle,
+                cx,
+            );
+        }
+        store.begin_restoring(saved.clone());
+    });
+    let after_toggling_off = persisted_rows(cx);
+    breakpoint_store
+        .update(cx, |store, cx| store.finish_restoring(cx))
+        .await
+        .unwrap();
+    let restored = persisted_rows(cx);
+
+    breakpoint_store.update(cx, |store, cx| {
+        store.begin_restoring(saved);
+        store.clear_breakpoints(cx);
+    });
+    breakpoint_store
+        .update(cx, |store, cx| store.finish_restoring(cx))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (
+            while_restoring,
+            after_toggling_off,
+            restored,
+            persisted_rows(cx)
+        ),
+        (
+            vec![
+                (main_path.clone(), vec![1, 2]),
+                (other_path.clone(), vec![0])
+            ],
+            vec![(main_path.clone(), vec![2]), (other_path.clone(), vec![0])],
+            vec![(main_path, vec![2]), (other_path, vec![0])],
+            Vec::new()
+        )
+    );
+}
+
+#[gpui::test]
+async fn test_restoring_breakpoints_of_an_unreadable_file_keeps_them(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let text = "First line\nSecond line\nThird line";
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/a"), json!({ "main.rs": text }))
+        .await;
+    fs.insert_tree(path!("/outside"), json!({ "locked.rs": text }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let locked_path = Arc::<Path>::from(Path::new(path!("/outside/locked.rs")));
+    let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+    let rows = |breakpoints: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>| {
+        breakpoints
+            .into_iter()
+            .map(|(path, breakpoints)| {
+                (
+                    path,
+                    breakpoints
+                        .iter()
+                        .map(|breakpoint| breakpoint.row)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    fs.set_path_error(&locked_path, Some(std::io::ErrorKind::PermissionDenied));
+    breakpoint_store.update(cx, |store, _| {
+        store.begin_restoring(BTreeMap::from([(
+            locked_path.clone(),
+            vec![SourceBreakpoint {
+                row: 2,
+                path: locked_path.clone(),
+                message: None,
+                condition: None,
+                hit_condition: None,
+                state: BreakpointState::Enabled,
+            }],
+        )]))
+    });
+    breakpoint_store
+        .update(cx, |store, cx| store.finish_restoring(cx))
+        .await
+        .unwrap();
+    let while_unreadable = breakpoint_store.read_with(cx, |store, cx| {
+        rows(store.source_breakpoints_to_persist(cx))
     });
 
-    breakpoint_store
-        .update(cx, |store, cx| {
-            store.with_serialized_breakpoints(
-                BTreeMap::from([(
-                    abs_path.clone(),
-                    vec![SourceBreakpoint {
-                        row: 3,
-                        path: abs_path.clone(),
-                        message: None,
-                        condition: None,
-                        hit_condition: None,
-                        state: BreakpointState::Enabled,
-                    }],
-                )]),
-                cx,
-            )
+    fs.set_path_error(&locked_path, None);
+    project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(&locked_path, cx)
         })
         .await
         .unwrap();
+    cx.run_until_parked();
+    let once_readable =
+        breakpoint_store.read_with(cx, |store, cx| rows(store.all_source_breakpoints(cx)));
+
+    assert_eq!(
+        (while_unreadable, once_readable),
+        (
+            vec![(locked_path.clone(), vec![2])],
+            vec![(locked_path, vec![2])]
+        )
+    );
+}
+
+#[gpui::test]
+async fn test_restored_breakpoints_follow_edits_made_while_restoring(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let text = "First line\nSecond line\nThird line\nFourth line";
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/a"), json!({ "main.rs": text, "other.rs": text }))
+        .await;
+    let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
+    let main_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/a/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let main_path = Arc::<Path>::from(Path::new(path!("/a/main.rs")));
+    let other_path = Arc::<Path>::from(Path::new(path!("/a/other.rs")));
+    let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+    let saved = BTreeMap::from([&main_path, &other_path].map(|path| {
+        let breakpoint = SourceBreakpoint {
+            row: 2,
+            path: path.clone(),
+            message: None,
+            condition: None,
+            hit_condition: None,
+            state: BreakpointState::Enabled,
+        };
+        (path.clone(), vec![breakpoint])
+    }));
+
+    breakpoint_store.update(cx, |store, _| store.begin_restoring(saved));
+    let restoring = breakpoint_store.update(cx, |store, cx| store.finish_restoring(cx));
+    main_buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "Inserted line\n")], None, cx);
+    });
+    restoring.await.unwrap();
 
     let breakpoints = breakpoint_store.read_with(cx, |store, cx| store.all_source_breakpoints(cx));
     assert_breakpoint(
         &breakpoints,
-        &abs_path,
-        vec![
-            (1, Breakpoint::new_standard()),
-            (3, Breakpoint::new_standard()),
-        ],
+        &main_path,
+        vec![(3, Breakpoint::new_standard())],
+    );
+    assert_breakpoint(
+        &breakpoints,
+        &other_path,
+        vec![(2, Breakpoint::new_standard())],
     );
 }
 
@@ -37547,6 +37796,130 @@ async fn test_breakpoint_enabling_and_disabling(cx: &mut TestAppContext) {
             (2, disable_breakpoint),
             (3, Breakpoint::new_standard()),
         ],
+    );
+}
+
+#[gpui::test]
+async fn test_row_breakpoint_actions_cover_every_breakpoint_on_a_joined_row(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/a"), json!({ "main.rs": "first();\nsecond();\n" }))
+        .await;
+    let project = Project::test(fs, [path!("/a").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/a/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        Editor::new(
+            EditorMode::full(),
+            MultiBuffer::build_from_buffer(buffer, cx),
+            Some(project.clone()),
+            window,
+            cx,
+        )
+    });
+    let breakpoints = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor
+                .breakpoint_store()
+                .unwrap()
+                .read(cx)
+                .all_source_breakpoints(cx)
+                .into_values()
+                .flatten()
+                .map(|breakpoint| (breakpoint.row, breakpoint.state))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx);
+        editor.move_down(&MoveDown, window, cx);
+        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx);
+        editor.move_up(&MoveUp, window, cx);
+        editor.join_lines(&JoinLines, window, cx);
+    });
+    let joined = breakpoints(&editor, cx);
+    editor.update_in(cx, |editor, window, cx| {
+        editor.disable_breakpoint(&actions::DisableBreakpoint, window, cx)
+    });
+    let disabled = breakpoints(&editor, cx);
+    editor.update_in(cx, |editor, window, cx| {
+        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx)
+    });
+    let toggled = breakpoints(&editor, cx);
+
+    assert_eq!(
+        (joined, disabled, toggled),
+        (
+            Vec::from([(0, BreakpointState::Enabled), (0, BreakpointState::Enabled)]),
+            Vec::from([
+                (0, BreakpointState::Disabled),
+                (0, BreakpointState::Disabled)
+            ]),
+            Vec::new(),
+        )
+    );
+}
+
+#[gpui::test]
+async fn test_breakpoint_actions_apply_once_to_a_breakpoint_reached_from_a_deleted_hunk(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("before\nˇlive\nafter");
+    cx.set_head_text("before\nremoved\nlive\nafter");
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx);
+        editor.expand_all_diff_hunks(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+    let breakpoints = |cx: &mut EditorTestContext| {
+        cx.update_editor(|editor, _, cx| {
+            editor
+                .breakpoint_store()
+                .unwrap()
+                .read(cx)
+                .all_source_breakpoints(cx)
+                .into_values()
+                .flatten()
+                .map(|breakpoint| (breakpoint.row, breakpoint.state))
+                .collect::<Vec<_>>()
+        })
+    };
+    let select_deleted_and_live_rows = |cx: &mut EditorTestContext| {
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([
+                    Point::new(1, 0)..Point::new(1, 0),
+                    Point::new(2, 0)..Point::new(2, 0),
+                ])
+            });
+            editor.selections.count()
+        })
+    };
+
+    let selections = select_deleted_and_live_rows(&mut cx);
+    cx.update_editor(|editor, window, cx| {
+        editor.disable_breakpoint(&actions::DisableBreakpoint, window, cx)
+    });
+    let disabled = breakpoints(&mut cx);
+    select_deleted_and_live_rows(&mut cx);
+    cx.update_editor(|editor, window, cx| {
+        editor.toggle_breakpoint(&actions::ToggleBreakpoint, window, cx)
+    });
+    let toggled = breakpoints(&mut cx);
+
+    assert_eq!(
+        (selections, disabled, toggled),
+        (2, Vec::from([(1, BreakpointState::Disabled)]), Vec::new())
     );
 }
 

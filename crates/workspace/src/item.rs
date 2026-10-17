@@ -1,13 +1,14 @@
 use crate::{
     CollaboratorId, DelayedDebouncedEditAction, FollowableViewRegistry, ItemNavHistory,
-    SerializableItemRegistry, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
+    ItemSerializationOutcome, SerializableItemRegistry, ToolbarItemLocation, ViewId, Workspace,
+    WorkspaceId,
     invalid_item_view::InvalidItemView,
     pane::{self, Pane},
     persistence::model::ItemId,
     searchable::SearchableItemHandle,
     workspace_settings::{AutosaveSetting, WorkspaceSettings},
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use client::{Client, proto};
 use futures::channel::mpsc;
 use gpui::{
@@ -26,6 +27,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
+    future::Future,
     path::Path,
     rc::Rc,
     sync::Arc,
@@ -35,6 +37,35 @@ use ui::{Color, Icon, IntoElement, Label, LabelCommon};
 use util::ResultExt;
 
 pub const LEADER_UPDATE_THROTTLE: Duration = Duration::from_millis(200);
+
+impl Workspace {
+    pub fn serialize_panel_item(
+        &self,
+        item: Box<dyn SerializableItemHandle>,
+        cx: &mut App,
+    ) -> impl Future<Output = Result<()>> + use<> {
+        let write = self
+            .workspace_writes
+            .serialize_item(item, self.database_id, false, cx);
+        async move {
+            match write.await {
+                ItemSerializationOutcome::Written | ItemSerializationOutcome::Declined => Ok(()),
+                ItemSerializationOutcome::Failed(error) => Err(anyhow!("{error:#}")),
+            }
+        }
+    }
+
+    pub fn item_removed_from_pane(&mut self, item_id: EntityId, pane: &Entity<Pane>) {
+        if self
+            .panes_by_item
+            .get(&item_id)
+            .is_some_and(|registered_pane| registered_pane.entity_id() == pane.entity_id())
+        {
+            self.panes_by_item.remove(&item_id);
+            self.queued_item_serializations.remove(&item_id);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SaveOptions {
@@ -427,21 +458,30 @@ pub trait SerializableItem: Item {
 
     fn serialize(
         &mut self,
-        workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         item_id: ItemId,
         closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>>;
 
+    fn copy_serialized_metadata(
+        _workspace_id: WorkspaceId,
+        _source_item_id: ItemId,
+        _destination_item_id: ItemId,
+        _cx: &mut App,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
+    }
+
     fn should_serialize(&self, event: &Self::Event) -> bool;
 }
 
 pub trait SerializableItemHandle: ItemHandle {
-    fn serialized_item_kind(&self) -> &'static str;
+    fn serialized_item_kind(&self, cx: &App) -> SharedString;
     fn persistent_item_id(&self, cx: &mut App) -> ItemId;
     fn serialize(
         &self,
-        workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         closing: bool,
         cx: &mut App,
     ) -> Option<Task<Result<()>>>;
@@ -452,8 +492,8 @@ impl<T> SerializableItemHandle for Entity<T>
 where
     T: SerializableItem,
 {
-    fn serialized_item_kind(&self) -> &'static str {
-        T::serialized_item_kind()
+    fn serialized_item_kind(&self, _cx: &App) -> SharedString {
+        SharedString::new_static(T::serialized_item_kind())
     }
 
     fn persistent_item_id(&self, cx: &mut App) -> ItemId {
@@ -462,13 +502,13 @@ where
 
     fn serialize(
         &self,
-        workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         closing: bool,
         cx: &mut App,
     ) -> Option<Task<Result<()>>> {
         let item_id = self.persistent_item_id(cx);
         self.update(cx, |this, cx| {
-            this.serialize(workspace, item_id, closing, cx)
+            this.serialize(workspace_id, item_id, closing, cx)
         })
     }
 
@@ -785,7 +825,7 @@ impl<T: Item> ItemHandle for Entity<T> {
             });
         }
 
-        if old_item_pane.is_none() {
+        if workspace.subscribed_items.insert(self.item_id()) {
             let mut pending_autosave = DelayedDebouncedEditAction::new();
             let (pending_update_tx, mut pending_update_rx) = mpsc::unbounded();
             let pending_update = Rc::new(RefCell::new(None));
@@ -940,6 +980,7 @@ impl<T: Item> ItemHandle for Entity<T> {
                         }
 
                         ItemEvent::Edit => {
+                            workspace.invalidate_persistence();
                             let autosave = item.workspace_settings(cx).autosave;
 
                             if let AutosaveSetting::AfterDelay { milliseconds } = autosave {
@@ -1003,15 +1044,16 @@ impl<T: Item> ItemHandle for Entity<T> {
             .detach();
 
             let item_id = self.item_id();
-            workspace.update_item_dirty_state(self, window, cx);
             cx.observe_release_in(self, window, move |workspace, _, _, _| {
                 workspace.panes_by_item.remove(&item_id);
+                workspace.subscribed_items.remove(&item_id);
                 event_subscription.take();
                 send_follower_updates.take();
             })
             .detach();
         }
 
+        workspace.update_item_dirty_state(self, window, cx);
         cx.defer_in(window, |workspace, window, cx| {
             workspace.serialize_workspace(window, cx);
         });
@@ -1463,6 +1505,10 @@ pub mod test {
 
     impl Global for FailingTestItemDeserialization {}
 
+    pub struct FailingTestItemSerialization;
+
+    impl Global for FailingTestItemSerialization {}
+
     pub struct TestProjectItem {
         pub entry_id: Option<ProjectEntryId>,
         pub project_path: Option<ProjectPath>,
@@ -1486,7 +1532,7 @@ pub mod test {
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
         pub tab_detail: Cell<Option<usize>>,
-        serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
+        serialize: Option<Box<dyn Fn(Option<WorkspaceId>) -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
     }
@@ -1633,8 +1679,15 @@ pub mod test {
         }
 
         pub fn with_serialize(
-            mut self,
+            self,
             serialize: impl Fn() -> Option<Task<anyhow::Result<()>>> + 'static,
+        ) -> Self {
+            self.with_serialize_to(move |_| serialize())
+        }
+
+        pub fn with_serialize_to(
+            mut self,
+            serialize: impl Fn(Option<WorkspaceId>) -> Option<Task<anyhow::Result<()>>> + 'static,
         ) -> Self {
             self.serialize = Some(Box::new(serialize));
             self
@@ -1919,13 +1972,16 @@ pub mod test {
 
         fn serialize(
             &mut self,
-            _workspace: &mut Workspace,
+            workspace_id: Option<WorkspaceId>,
             _item_id: ItemId,
             _closing: bool,
-            _cx: &mut Context<Self>,
+            cx: &mut Context<Self>,
         ) -> Option<Task<anyhow::Result<()>>> {
+            if cx.has_global::<FailingTestItemSerialization>() {
+                return Some(Task::ready(Err(anyhow::anyhow!("the disk is full"))));
+            }
             if let Some(serialize) = self.serialize.take() {
-                let result = serialize();
+                let result = serialize(workspace_id);
                 self.serialize = Some(serialize);
                 result
             } else {
@@ -1936,5 +1992,60 @@ pub mod test {
         fn should_serialize(&self, _event: &Self::Event) -> bool {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ItemEvent, test::TestItem};
+    use crate::{MultiWorkspace, tests::init_test};
+    use gpui::{AppContext as _, TestAppContext};
+    use project::{FakeFs, Project};
+
+    #[gpui::test]
+    async fn test_reattaching_item_refreshes_dirty_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let (workspace, pane, item) = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                let pane = workspace.read(cx).active_pane().clone();
+                let item = cx.new(TestItem::new);
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(item.clone()), true, false, None, window, cx);
+                });
+                (workspace, pane, item)
+            })
+            .unwrap();
+        workspace.read_with(cx, |workspace, _| assert!(workspace.dirty_items.is_empty()));
+        window_handle
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(item.entity_id(), false, false, window, cx);
+                });
+            })
+            .unwrap();
+        item.update(cx, |item, cx| {
+            item.is_dirty = true;
+            cx.emit(ItemEvent::UpdateTab);
+        });
+        workspace.read_with(cx, |workspace, _| assert!(workspace.dirty_items.is_empty()));
+        window_handle
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(item.clone()), true, false, None, window, cx);
+                });
+            })
+            .unwrap();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.dirty_items.keys().copied().collect::<Vec<_>>(),
+                vec![item.entity_id()],
+            );
+            assert!(workspace.is_window_edited(cx));
+            assert_eq!(workspace.subscribed_items.len(), 1);
+        });
     }
 }

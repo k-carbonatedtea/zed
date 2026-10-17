@@ -51,7 +51,7 @@ use ui::{
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items_keeping,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
@@ -153,6 +153,8 @@ pub struct TerminalView {
     show_workspace_actions: Option<bool>,
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
+    serialization_revision: u64,
+    last_known_working_directory: Option<PathBuf>,
     custom_title: Option<String>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
@@ -266,6 +268,10 @@ impl TerminalView {
         let cursor_shape = TerminalSettings::get_global(cx).cursor_shape;
 
         let scroll_handle = TerminalScrollHandle::new(terminal.read(cx));
+        let last_known_working_directory = terminal
+            .read(cx)
+            .working_directory()
+            .filter(|cwd| !cwd.as_os_str().is_empty());
 
         let blink_manager = cx.new(|cx| {
             BlinkManager::new(
@@ -310,6 +316,8 @@ impl TerminalView {
             scroll_top: Pixels::ZERO,
             scroll_handle,
             needs_serialize: false,
+            serialization_revision: 0,
+            last_known_working_directory,
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
@@ -487,14 +495,14 @@ impl TerminalView {
         let label = label.filter(|l| !l.trim().is_empty());
         if self.custom_title != label {
             self.custom_title = label;
-            self.needs_serialize = true;
-            cx.emit(ItemEvent::UpdateTab);
+            self.mark_needs_serialize(cx);
             cx.notify();
         }
     }
 
     pub(crate) fn mark_needs_serialize(&mut self, cx: &mut Context<Self>) {
         self.needs_serialize = true;
+        self.serialization_revision += 1;
         cx.emit(ItemEvent::UpdateTab);
     }
 
@@ -1163,6 +1171,12 @@ impl TerminalView {
         dispatch_context
     }
 
+    fn update_last_known_working_directory(&mut self, cwd: Option<PathBuf>) {
+        if let Some(cwd) = cwd.filter(|cwd| !cwd.as_os_str().is_empty()) {
+            self.last_known_working_directory = Some(cwd);
+        }
+    }
+
     fn set_terminal(
         &mut self,
         terminal: Entity<Terminal>,
@@ -1216,9 +1230,11 @@ fn subscribe_for_terminal_events(
         window,
         move |terminal_view, terminal, event, window, cx| {
             let current_cwd = terminal.read(cx).working_directory();
+            terminal_view.update_last_known_working_directory(current_cwd.clone());
             if current_cwd != previous_cwd {
                 previous_cwd = current_cwd;
                 terminal_view.needs_serialize = true;
+                terminal_view.serialization_revision += 1;
             }
 
             match event {
@@ -1761,80 +1777,12 @@ impl Item for TerminalView {
                 return false;
             };
 
-            if item.downcast::<TerminalView>().is_some() {
-                let Some(split_direction) = active_pane.drag_split_direction() else {
-                    return false;
-                };
-
-                let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
-                    return false;
-                };
-
-                if !terminal_panel.read(cx).center.panes().contains(&&this_pane) {
-                    return false;
-                }
-
-                let source = tab.pane.clone();
-                let item_id_to_move = item.item_id();
-                let is_zoomed = {
-                    let terminal_panel = terminal_panel.read(cx);
-                    if terminal_panel.active_pane == this_pane {
-                        active_pane.is_zoomed()
-                    } else {
-                        terminal_panel.active_pane.read(cx).is_zoomed()
-                    }
-                };
-
-                let workspace = workspace.downgrade();
-                let terminal_panel = terminal_panel.downgrade();
-                // Defer the split operation to avoid re-entrancy panic.
-                // The pane may be the one currently being updated, so we cannot
-                // call mark_positions (via split) synchronously.
-                window
-                    .spawn(cx, async move |cx| {
-                        cx.update(|window, cx| {
-                            let Ok(new_pane) = terminal_panel.update(cx, |terminal_panel, cx| {
-                                let new_pane = terminal_panel::new_terminal_pane(
-                                    workspace, project, is_zoomed, window, cx,
-                                );
-                                terminal_panel.apply_tab_bar_buttons(&new_pane, cx);
-                                terminal_panel.center.split(
-                                    &this_pane,
-                                    &new_pane,
-                                    split_direction,
-                                    cx,
-                                );
-                                anyhow::Ok(new_pane)
-                            }) else {
-                                return;
-                            };
-
-                            let Some(new_pane) = new_pane.log_err() else {
-                                return;
-                            };
-
-                            workspace::move_item(
-                                &source,
-                                &new_pane,
-                                item_id_to_move,
-                                new_pane.read(cx).active_item_index(),
-                                true,
-                                window,
-                                cx,
-                            );
-                        })
-                        .ok();
-                    })
-                    .detach();
-
+            if item.downcast::<TerminalView>().is_none()
+                && let Some(project_path) = item.project_path(cx)
+                && let Some(path) = project.read(cx).absolute_path(&project_path, cx)
+            {
+                self.add_paths_to_terminal(&[path], window, cx);
                 return true;
-            } else {
-                if let Some(project_path) = item.project_path(cx)
-                    && let Some(path) = project.read(cx).absolute_path(&project_path, cx)
-                {
-                    self.add_paths_to_terminal(&[path], window, cx);
-                    return true;
-                }
             }
 
             return false;
@@ -1967,19 +1915,11 @@ impl Item for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal().read(cx).task().is_none() {
-            if let Some((new_id, old_id)) = workspace.database_id().zip(self.workspace_id) {
-                log::debug!(
-                    "Updating workspace id for the terminal, old: {old_id:?}, new: {new_id:?}",
-                );
-                let db = TerminalDb::global(cx);
-                let item_id = workspace::persistent_item_id(&cx.entity(), cx);
-                cx.background_spawn(async move {
-                    db.update_workspace_id(new_id, old_id, item_id).await
-                })
-                .detach();
-            }
+        if self.terminal().read(cx).task().is_none() && self.workspace_id != workspace.database_id()
+        {
             self.workspace_id = workspace.database_id();
+            self.needs_serialize = true;
+            self.serialization_revision += 1;
         }
     }
 
@@ -2000,12 +1940,19 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
         let db = TerminalDb::global(cx);
-        delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+        delete_unloaded_items_keeping(
+            alive_items,
+            workspace_id,
+            "terminals",
+            &db,
+            persistence::persisted_panel_item_ids,
+            cx,
+        )
     }
 
     fn serialize(
         &mut self,
-        _workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
@@ -2015,23 +1962,37 @@ impl SerializableItem for TerminalView {
             return None;
         }
 
-        if !self.needs_serialize {
+        if !self.needs_serialize || workspace_id != self.workspace_id {
             return None;
         }
 
-        let workspace_id = self.workspace_id?;
+        let workspace_id = workspace_id?;
         let cwd = terminal.working_directory();
+        self.update_last_known_working_directory(cwd);
+        let cwd = self.last_known_working_directory.clone();
         let custom_title = self.custom_title.clone();
-        self.needs_serialize = false;
+        let revision = self.serialization_revision;
 
         let db = TerminalDb::global(cx);
-        Some(cx.background_spawn(async move {
+        let write = cx.background_spawn(async move {
             if let Some(cwd) = cwd {
                 db.save_working_directory(item_id, workspace_id, cwd)
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
-                .await?;
+                .await
+        });
+        Some(cx.spawn(async move |terminal_view, cx| {
+            write.await?;
+            terminal_view
+                .update(cx, |terminal_view, _| {
+                    if terminal_view.workspace_id == Some(workspace_id)
+                        && terminal_view.serialization_revision == revision
+                    {
+                        terminal_view.needs_serialize = false;
+                    }
+                })
+                .ok();
             Ok(())
         }))
     }
@@ -2049,38 +2010,34 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, persisted_cwd, custom_title) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
                         .get_working_directory(item_id, workspace_id)
                         .log_err()
-                        .flatten();
-                    let cwd = if from_db
-                        .as_ref()
-                        .is_some_and(|from_db| !from_db.as_os_str().is_empty())
-                    {
-                        from_db
-                    } else {
+                        .flatten()
+                        .filter(|cwd| !cwd.as_os_str().is_empty());
+                    let cwd = from_db.clone().or_else(|| {
                         workspace
                             .upgrade()
                             .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
-                    };
+                    });
                     let custom_title = db
                         .get_custom_title(item_id, workspace_id)
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    (cwd, from_db, custom_title)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
             let terminal = project
                 .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
                 .await?;
             cx.update(|window, cx| {
-                let view = cx.new(|cx| {
+                cx.new(|cx| {
                     let mut view = TerminalView::new(
                         terminal,
                         workspace,
@@ -2092,12 +2049,13 @@ impl SerializableItem for TerminalView {
                     if custom_title.is_some() {
                         view.custom_title = custom_title;
                     }
+                    if view.last_known_working_directory.is_none() {
+                        view.last_known_working_directory = persisted_cwd;
+                    }
+                    view.needs_serialize = true;
+                    view.serialization_revision += 1;
                     view
-                });
-                if workspace::claim_persistent_item_id(&view, item_id, cx) != item_id {
-                    view.update(cx, |view, _| view.needs_serialize = true);
-                }
-                view
+                })
             })
         })
     }

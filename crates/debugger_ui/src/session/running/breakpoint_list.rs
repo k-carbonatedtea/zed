@@ -12,7 +12,7 @@ use language::Point;
 use project::{
     Project,
     debugger::{
-        breakpoint_store::{BreakpointEditAction, BreakpointStore, SourceBreakpoint},
+        breakpoint_store::{BreakpointEditAction, BreakpointId, BreakpointStore, SourceBreakpoint},
         dap_store::{DapStore, PersistedAdapterOptions},
         session::Session,
     },
@@ -112,24 +112,24 @@ impl BreakpointList {
     fn edit_line_breakpoint(
         &self,
         path: Arc<Path>,
-        row: u32,
+        id: BreakpointId,
         action: BreakpointEditAction,
         cx: &mut App,
     ) {
-        Self::edit_line_breakpoint_inner(&self.breakpoint_store, path, row, action, cx);
+        Self::edit_line_breakpoint_inner(&self.breakpoint_store, path, id, action, cx);
     }
     fn edit_line_breakpoint_inner(
         breakpoint_store: &Entity<BreakpointStore>,
         path: Arc<Path>,
-        row: u32,
+        id: BreakpointId,
         action: BreakpointEditAction,
         cx: &mut App,
     ) {
         breakpoint_store.update(cx, |breakpoint_store, cx| {
-            if let Some((buffer, breakpoint)) = breakpoint_store.breakpoint_at_row(&path, row, cx) {
+            if let Some((buffer, breakpoint)) = breakpoint_store.breakpoint_with_id(&path, id) {
                 breakpoint_store.toggle_breakpoint(buffer, breakpoint, action, cx);
             } else {
-                log::error!("Couldn't find breakpoint at row event though it exists: row {row}")
+                log::error!("Couldn't find breakpoint {id:?} in {path:?}")
             }
         })
     }
@@ -330,7 +330,7 @@ impl BreakpointList {
                             Self::edit_line_breakpoint_inner(
                                 &self.breakpoint_store,
                                 line_breakpoint.breakpoint.path.clone(),
-                                line_breakpoint.breakpoint.row,
+                                line_breakpoint.id,
                                 BreakpointEditAction::EditLogMessage(Arc::from(text)),
                                 cx,
                             );
@@ -341,7 +341,7 @@ impl BreakpointList {
                             Self::edit_line_breakpoint_inner(
                                 &self.breakpoint_store,
                                 line_breakpoint.breakpoint.path.clone(),
-                                line_breakpoint.breakpoint.row,
+                                line_breakpoint.id,
                                 BreakpointEditAction::EditCondition(Arc::from(text)),
                                 cx,
                             );
@@ -352,7 +352,7 @@ impl BreakpointList {
                             Self::edit_line_breakpoint_inner(
                                 &self.breakpoint_store,
                                 line_breakpoint.breakpoint.path.clone(),
-                                line_breakpoint.breakpoint.row,
+                                line_breakpoint.id,
                                 BreakpointEditAction::EditHitCondition(Arc::from(text)),
                                 cx,
                             );
@@ -394,8 +394,8 @@ impl BreakpointList {
         match &mut entry.kind {
             BreakpointEntryKind::LineBreakpoint(line_breakpoint) => {
                 let path = line_breakpoint.breakpoint.path.clone();
-                let row = line_breakpoint.breakpoint.row;
-                self.edit_line_breakpoint(path, row, BreakpointEditAction::InvertState, cx);
+                let id = line_breakpoint.id;
+                self.edit_line_breakpoint(path, id, BreakpointEditAction::InvertState, cx);
             }
             BreakpointEntryKind::ExceptionBreakpoint(exception_breakpoint) => {
                 let id = exception_breakpoint.id.clone();
@@ -421,8 +421,8 @@ impl BreakpointList {
 
         if let BreakpointEntryKind::LineBreakpoint(line_breakpoint) = &mut entry.kind {
             let path = line_breakpoint.breakpoint.path.clone();
-            let row = line_breakpoint.breakpoint.row;
-            self.edit_line_breakpoint(path, row, BreakpointEditAction::Toggle, cx);
+            let id = line_breakpoint.id;
+            self.edit_line_breakpoint(path, id, BreakpointEditAction::Toggle, cx);
         }
         cx.notify();
     }
@@ -661,7 +661,10 @@ impl BreakpointList {
 
 impl Render for BreakpointList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl ui::IntoElement {
-        let breakpoints = self.breakpoint_store.read(cx).all_source_breakpoints(cx);
+        let breakpoints = self
+            .breakpoint_store
+            .read(cx)
+            .all_source_breakpoints_with_ids(cx);
         self.breakpoints.clear();
         let multiple_worktrees = self.worktree_store.read(cx).visible_worktrees(cx).count() > 1;
         let weak = cx.weak_entity();
@@ -679,9 +682,9 @@ impl Render for BreakpointList {
                         }
                     })
                 });
-            breakpoints.sort_by_key(|breakpoint| breakpoint.row);
+            breakpoints.sort_by_key(|(_, breakpoint)| breakpoint.row);
             let weak = weak.clone();
-            breakpoints.into_iter().filter_map(move |breakpoint| {
+            breakpoints.into_iter().filter_map(move |(id, breakpoint)| {
                 debug_assert_eq!(&path, &breakpoint.path);
                 let file_name = breakpoint.path.file_name()?;
 
@@ -703,6 +706,7 @@ impl Render for BreakpointList {
                         dir,
                         line,
                         breakpoint,
+                        id,
                     }),
                     weak,
                 })
@@ -815,6 +819,7 @@ struct LineBreakpoint {
     dir: Option<SharedString>,
     line: u32,
     breakpoint: SourceBreakpoint,
+    id: BreakpointId,
 }
 
 impl LineBreakpoint {
@@ -834,12 +839,13 @@ impl LineBreakpoint {
         };
         let path = self.breakpoint.path.clone();
         let row = self.breakpoint.row;
+        let id = self.id;
         let is_enabled = self.breakpoint.state.is_enabled();
 
         let indicator = div()
             .id(SharedString::from(format!(
-                "breakpoint-ui-toggle-{:?}/{}:{}",
-                self.dir, self.name, self.line
+                "breakpoint-ui-toggle-{:?}/{}:{}:{:?}",
+                self.dir, self.name, self.line, self.id
             )))
             .child(
                 Icon::new(icon_name)
@@ -868,7 +874,7 @@ impl LineBreakpoint {
                     weak.update(cx, |breakpoint_list, cx| {
                         breakpoint_list.edit_line_breakpoint(
                             path.clone(),
-                            row,
+                            id,
                             BreakpointEditAction::InvertState,
                             cx,
                         );
@@ -879,8 +885,8 @@ impl LineBreakpoint {
             .on_mouse_down(MouseButton::Left, move |_, _, _| {});
 
         ListItem::new(SharedString::from(format!(
-            "breakpoint-ui-item-{:?}/{}:{}",
-            self.dir, self.name, self.line
+            "breakpoint-ui-item-{:?}/{}:{}:{:?}",
+            self.dir, self.name, self.line, self.id
         )))
         .toggle_state(is_selected)
         .inset(true)
@@ -900,8 +906,8 @@ impl LineBreakpoint {
         .child(
             h_flex()
                 .id(SharedString::from(format!(
-                    "breakpoint-ui-on-click-go-to-line-{:?}/{}:{}",
-                    self.dir, self.name, self.line
+                    "breakpoint-ui-on-click-go-to-line-{:?}/{}:{}:{:?}",
+                    self.dir, self.name, self.line, self.id
                 )))
                 .w_full()
                 .gap_1()
@@ -1216,8 +1222,8 @@ impl BreakpointEntry {
     fn id(&self) -> SharedString {
         match &self.kind {
             BreakpointEntryKind::LineBreakpoint(line_breakpoint) => format!(
-                "source-breakpoint-control-strip-{:?}:{}",
-                line_breakpoint.breakpoint.path, line_breakpoint.breakpoint.row
+                "source-breakpoint-control-strip-{:?}:{}:{:?}",
+                line_breakpoint.breakpoint.path, line_breakpoint.breakpoint.row, line_breakpoint.id
             )
             .into(),
             BreakpointEntryKind::ExceptionBreakpoint(exception_breakpoint) => format!(
@@ -1504,5 +1510,91 @@ impl RenderOnce for BreakpointOptionsStrip {
                     ))
 
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::init_test;
+    use gpui::{TestAppContext, VisualTestContext, point, size};
+    use project::{
+        FakeFs,
+        debugger::breakpoint_store::{Breakpoint, BreakpointState, BreakpointWithPosition},
+    };
+    use serde_json::json;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_line_breakpoint_entries_edit_their_own_breakpoint(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ "main.rs": "first();second();\n" }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/main.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+        let position = buffer.read_with(cx, |buffer, _| buffer.anchor_after(Point::new(0, 0)));
+        for condition in ["flag", "!flag"] {
+            breakpoint_store.update(cx, |breakpoint_store, cx| {
+                breakpoint_store.toggle_breakpoint(
+                    buffer.clone(),
+                    BreakpointWithPosition::new(
+                        position,
+                        Breakpoint {
+                            condition: Some(Arc::from(condition)),
+                            ..Breakpoint::new_standard()
+                        },
+                    ),
+                    BreakpointEditAction::Toggle,
+                    cx,
+                )
+            });
+        }
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let breakpoint_list = window
+            .update(cx, |multi_workspace, window, cx| {
+                BreakpointList::new(
+                    None,
+                    multi_workspace.workspace().downgrade(),
+                    &project,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+
+        cx.draw(point(px(0.), px(0.)), size(px(800.), px(600.)), |_, _| {
+            div().size_full().child(breakpoint_list.clone())
+        });
+        breakpoint_list.update_in(cx, |breakpoint_list, window, cx| {
+            breakpoint_list.select_ix(Some(1), window, cx);
+            breakpoint_list.toggle_enable_breakpoint(&ToggleEnableBreakpoint, window, cx);
+        });
+
+        assert_eq!(
+            breakpoint_store.read_with(cx, |breakpoint_store, _| {
+                breakpoint_store
+                    .breakpoints_from_path(&Arc::from(Path::new(path!("/project/main.rs"))))
+                    .into_iter()
+                    .map(|breakpoint| (breakpoint.bp.condition, breakpoint.bp.state))
+                    .collect::<Vec<_>>()
+            }),
+            Vec::from([
+                (Some(Arc::from("flag")), BreakpointState::Enabled),
+                (Some(Arc::from("!flag")), BreakpointState::Disabled),
+            ])
+        );
     }
 }

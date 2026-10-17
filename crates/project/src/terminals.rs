@@ -624,6 +624,23 @@ impl Project {
         cx: &mut App,
     ) -> Shared<Task<Option<HashMap<String, String>>>> {
         if let Some(path) = &path {
+            if remote_client.is_none()
+                && self.find_worktree(path, cx).is_none()
+                && let Some(worktree) = self
+                    .active_entry()
+                    .and_then(|entry| self.worktree_for_entry(entry, cx))
+            {
+                let worktree = worktree.read(cx);
+                if worktree.is_single_file()
+                    && worktree.abs_path().parent() == Some(path.as_ref())
+                    && let Some(environment) = self
+                        .environment
+                        .read(cx)
+                        .cli_environment_for_worktree(Some(worktree))
+                {
+                    return Task::ready(Some(environment)).shared();
+                }
+            }
             let shell = Shell::Program(shell.to_string());
             self.environment
                 .update(cx, |project_env, cx| match &remote_client {
@@ -747,7 +764,12 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
     use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::path;
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {
@@ -756,6 +778,118 @@ mod tests {
             shell: Shell::Program("cmd.exe".to_string()),
             ..SpawnInTerminal::default()
         }
+    }
+
+    #[gpui::test]
+    async fn test_single_file_cli_environments_follow_the_selected_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "a.txt": "a", "b.txt": "b", "other": { "c.txt": "c" } }),
+        )
+        .await;
+        let project = Project::test(fs, [], cx).await;
+        let environment = project.read_with(cx, |project, _| project.environment().clone());
+        let mut observed = Vec::new();
+        for (root, label) in [
+            (path!("/root/a.txt"), "a"),
+            (path!("/root/b.txt"), "b"),
+            (path!("/root/other"), "other"),
+        ] {
+            let request = environment.update(cx, |environment, _| {
+                environment.request_cli_environment_for_roots(
+                    [Arc::from(Path::new(root))],
+                    HashMap::from_iter([(String::from("ROOT"), label.to_string())]),
+                )
+            });
+            let (worktree, _) = project
+                .update(cx, |project, cx| {
+                    project.find_or_create_worktree(root, true, cx)
+                })
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            drop(request);
+            project.update(cx, |project, cx| {
+                project.set_active_path(
+                    Some(ProjectPath {
+                        worktree_id: worktree.read(cx).id(),
+                        path: RelPath::empty_arc(),
+                    }),
+                    cx,
+                );
+            });
+            let default = environment
+                .update(cx, |environment, cx| environment.default_environment(cx))
+                .await;
+            let directory = environment
+                .update(cx, |environment, cx| {
+                    environment.local_directory_environment(
+                        &Shell::System,
+                        Arc::from(Path::new(path!("/root"))),
+                        cx,
+                    )
+                })
+                .await;
+            let active = project
+                .update(cx, |project, cx| {
+                    project.resolve_directory_environment(
+                        "sh",
+                        Some(Arc::from(Path::new(path!("/root")))),
+                        None,
+                        cx,
+                    )
+                })
+                .await;
+            observed.push([default, directory, active].map(|environment| {
+                environment.and_then(|environment| environment.get("ROOT").cloned())
+            }));
+        }
+        assert_eq!(
+            observed,
+            vec![
+                [
+                    Some(String::from("a")),
+                    Some(String::from("a")),
+                    Some(String::from("a"))
+                ],
+                [Some(String::from("a")), None, Some(String::from("b"))],
+                [Some(String::from("other")), None, None],
+            ]
+        );
+
+        project.update(cx, |project, cx| {
+            let (worktree, path) = project
+                .find_worktree(Path::new(path!("/root/b.txt")), cx)
+                .unwrap();
+            project.set_active_path(
+                Some(ProjectPath {
+                    worktree_id: worktree.read(cx).id(),
+                    path,
+                }),
+                cx,
+            );
+        });
+        let other = project
+            .update(cx, |project, cx| {
+                project.resolve_directory_environment(
+                    "sh",
+                    Some(Arc::from(Path::new(path!("/root/other")))),
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert_eq!(
+            other.and_then(|environment| environment.get("ROOT").cloned()),
+            Some(String::from("other"))
+        );
     }
 
     #[test]

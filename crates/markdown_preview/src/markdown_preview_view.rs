@@ -2256,18 +2256,19 @@ impl SerializableItem for MarkdownPreviewView {
 
     fn serialize(
         &mut self,
-        workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         item_id: ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        let workspace_id = workspace.database_id()?;
+        let workspace_id = workspace_id?;
         let editor = self.active_editor.as_ref()?.editor.clone();
         let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
         let file = buffer.read(cx).file()?;
         let worktree_id = file.worktree_id(cx);
-        let abs_path = workspace
-            .project()
+        let abs_path = editor
+            .read(cx)
+            .project()?
             .read(cx)
             .worktree_for_id(worktree_id, cx)?
             .read(cx)
@@ -3726,16 +3727,13 @@ mod tests {
         }
 
         let serialize_task = multi_workspace
-            .update(cx, |multi_workspace, _window, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                workspace.update(cx, |workspace, cx| {
-                    let item_id = workspace::persistent_item_id(&preview, cx);
-                    preview
-                        .update(cx, |preview, cx| {
-                            preview.serialize(workspace, item_id, false, cx)
-                        })
-                        .unwrap()
-                })
+            .update(cx, |_, _window, cx| {
+                let item_id = workspace::persistent_item_id(&preview, cx);
+                preview
+                    .update(cx, |preview, cx| {
+                        preview.serialize(Some(workspace_id), item_id, false, cx)
+                    })
+                    .unwrap()
             })
             .unwrap();
         serialize_task.await.unwrap();
@@ -3875,16 +3873,13 @@ mod tests {
         wait_for_preview_serialization(cx).await;
 
         let serialize_task = multi_workspace
-            .update(cx, |multi_workspace, _window, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                workspace.update(cx, |workspace, cx| {
-                    let item_id = workspace::persistent_item_id(&preview, cx);
-                    preview
-                        .update(cx, |preview, cx| {
-                            preview.serialize(workspace, item_id, false, cx)
-                        })
-                        .unwrap()
-                })
+            .update(cx, |_, _window, cx| {
+                let item_id = workspace::persistent_item_id(&preview, cx);
+                preview
+                    .update(cx, |preview, cx| {
+                        preview.serialize(Some(workspace_id), item_id, false, cx)
+                    })
+                    .unwrap()
             })
             .unwrap();
         serialize_task.await.unwrap();

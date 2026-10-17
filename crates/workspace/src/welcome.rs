@@ -1,6 +1,6 @@
 use crate::{
     NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    ToggleWorkspaceSidebar, Workspace, WorkspaceId, WorkspaceSettings,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
@@ -582,12 +582,12 @@ impl crate::SerializableItem for WelcomePage {
 
     fn serialize(
         &mut self,
-        workspace: &mut Workspace,
+        workspace_id: Option<WorkspaceId>,
         item_id: crate::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<gpui::Result<()>>> {
-        let workspace_id = workspace.database_id()?;
+        let workspace_id = workspace_id?;
         let db = persistence::WelcomePagesDb::global(cx);
         Some(cx.background_spawn(
             async move { db.save_welcome_page(item_id, workspace_id, true).await },

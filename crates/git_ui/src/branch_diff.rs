@@ -680,12 +680,12 @@ impl SerializableItem for BranchDiff {
 
     fn serialize(
         &mut self,
-        workspace: &mut Workspace,
+        workspace_id: Option<workspace::WorkspaceId>,
         item_id: workspace::ItemId,
         _closing: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        let workspace_id = workspace.database_id()?;
+        let workspace_id = workspace_id?;
         let DiffBase::Merge { base_ref } = self.diff_base(cx).clone() else {
             return None;
         };

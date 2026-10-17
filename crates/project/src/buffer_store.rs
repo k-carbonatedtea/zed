@@ -101,6 +101,19 @@ pub enum BufferStoreEvent {
 #[derive(Default, Debug, Clone)]
 pub struct ProjectTransaction(pub HashMap<Entity<Buffer>, language::Transaction>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReloadMode {
+    IfClean,
+    DiscardChanges,
+}
+
+impl ReloadMode {
+    fn should_reload(self, buffer: &Buffer) -> bool {
+        self == Self::DiscardChanges
+            || !(buffer.holds_unsaved_changes() || buffer.has_unsaved_edits())
+    }
+}
+
 impl PartialEq for ProjectTransaction {
     fn eq(&self, other: &Self) -> bool {
         self.0.len() == other.0.len()
@@ -406,7 +419,7 @@ impl LocalBufferStore {
         let file = buffer.file().cloned();
         if file
             .as_ref()
-            .is_some_and(|file| file.disk_state() == DiskState::New)
+            .is_some_and(|file| matches!(file.disk_state(), DiskState::New | DiskState::Deleted))
         {
             has_changed_file = true;
         }
@@ -455,13 +468,35 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) {
         cx.subscribe(worktree, |this, worktree, event, cx| {
-            if worktree.read(cx).is_local()
-                && let worktree::Event::UpdatedEntries(changes) = event
-            {
-                Self::local_worktree_entries_changed(this, &worktree, changes, cx);
+            if !worktree.read(cx).is_local() {
+                return;
+            }
+            match event {
+                worktree::Event::UpdatedEntries(changes) => {
+                    Self::local_worktree_entries_changed(this, &worktree, changes, cx);
+                }
+                worktree::Event::Deleted => Self::local_worktree_deleted(this, &worktree, cx),
+                _ => {}
             }
         })
         .detach();
+    }
+
+    fn local_worktree_deleted(
+        this: &mut BufferStore,
+        worktree: &Entity<Worktree>,
+        cx: &mut Context<BufferStore>,
+    ) {
+        let buffers = this
+            .buffers()
+            .filter(|buffer| {
+                File::from_dyn(buffer.read(cx).file())
+                    .is_some_and(|file| file.worktree == *worktree && file.disk_state.exists())
+            })
+            .collect::<Vec<_>>();
+        for buffer in buffers {
+            this.mark_file_deleted(&buffer, cx);
+        }
     }
 
     fn local_worktree_entries_changed(
@@ -804,13 +839,19 @@ impl LocalBufferStore {
     fn reload_buffers(
         &self,
         buffers: HashSet<Entity<Buffer>>,
+        mode: ReloadMode,
         push_to_history: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<ProjectTransaction>> {
         cx.spawn(async move |_, cx| {
             let mut project_transaction = ProjectTransaction::default();
             for buffer in buffers {
-                let transaction = buffer.update(cx, |buffer, cx| buffer.reload(cx)).await?;
+                let Some(reload) = buffer.update(cx, |buffer, cx| {
+                    mode.should_reload(buffer).then(|| buffer.reload(cx))
+                }) else {
+                    continue;
+                };
+                let transaction = reload.await?;
                 buffer.update(cx, |buffer, cx| {
                     if let Some(transaction) = transaction {
                         if !push_to_history {
@@ -1004,12 +1045,28 @@ impl BufferStore {
         cx.spawn(async move |this, cx| {
             task.await?;
             this.update(cx, |this, cx| {
-                old_file.clone().and_then(|file| {
-                    this.path_to_buffer_id.remove(&ProjectPath {
-                        worktree_id: file.worktree_id(cx),
-                        path: file.path().clone(),
-                    })
-                });
+                if let Some(old_file) = File::from_dyn(old_file.as_ref()) {
+                    let buffer = buffer.read(cx);
+                    let buffer_id = buffer.remote_id();
+                    let new_file = File::from_dyn(buffer.file());
+                    let old_path = ProjectPath {
+                        worktree_id: old_file.worktree_id(cx),
+                        path: old_file.path.clone(),
+                    };
+                    if new_file.is_none_or(|file| {
+                        file.worktree_id(cx) != old_path.worktree_id || file.path != old_path.path
+                    }) && this.path_to_buffer_id.get(&old_path) == Some(&buffer_id)
+                    {
+                        this.path_to_buffer_id.remove(&old_path);
+                    }
+                    if let Some(entry_id) = old_file.entry_id
+                        && new_file.and_then(|file| file.entry_id) != Some(entry_id)
+                        && let Some(local) = this.as_local_mut()
+                        && local.local_buffer_ids_by_entry_id.get(&entry_id) == Some(&buffer_id)
+                    {
+                        local.local_buffer_ids_by_entry_id.remove(&entry_id);
+                    }
+                }
 
                 cx.emit(BufferStoreEvent::BufferChangedFilePath { buffer, old_file });
             })
@@ -1175,6 +1232,40 @@ impl BufferStore {
             .retain(|_, buffer| !matches!(buffer, OpenBuffer::Operations(_)));
     }
 
+    pub fn mark_file_deleted(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
+            return;
+        };
+        if file.disk_state == DiskState::Deleted {
+            return;
+        }
+        let deleted_file = File {
+            disk_state: DiskState::Deleted,
+            ..file.clone()
+        };
+        let update = |project_id| proto::UpdateBufferFile {
+            project_id,
+            buffer_id: buffer.read(cx).remote_id().to_proto(),
+            file: Some(deleted_file.to_proto(cx)),
+        };
+        match &self.state {
+            BufferStoreState::Remote(remote) if !remote.upstream_client.is_via_collab() => {
+                remote
+                    .upstream_client
+                    .send(update(remote.project_id))
+                    .log_err();
+            }
+            _ => {
+                if let Some((downstream_client, project_id)) = &self.downstream_client {
+                    downstream_client.send(update(*project_id)).log_err();
+                }
+            }
+        }
+        buffer.update(cx, |buffer, cx| {
+            buffer.file_updated(Arc::new(deleted_file), cx)
+        });
+    }
+
     fn buffer_changed_file(&mut self, buffer: Entity<Buffer>, cx: &mut App) -> Option<()> {
         let file = File::from_dyn(buffer.read(cx).file())?;
 
@@ -1223,7 +1314,7 @@ impl BufferStore {
                     .send(proto::BufferReloaded {
                         project_id: *project_id,
                         buffer_id: buffer.remote_id().to_proto(),
-                        version: serialize_version(&buffer.version()),
+                        version: serialize_version(buffer.saved_version()),
                         mtime: buffer.saved_mtime().map(|t| t.into()),
                         line_ending: serialize_line_ending(buffer.line_ending()) as i32,
                     })
@@ -1396,6 +1487,20 @@ impl BufferStore {
         let buffer_id = BufferId::new(buffer_id)?;
 
         this.update(&mut cx, |this, cx| {
+            if this.as_local_mut().is_some() {
+                if envelope
+                    .payload
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.is_deleted)
+                    && let Some(buffer) = this.get(buffer_id)
+                    && File::from_dyn(buffer.read(cx).file())
+                        .is_some_and(|file| file.disk_state == DiskState::New)
+                {
+                    this.mark_file_deleted(&buffer, cx);
+                }
+                return Ok(());
+            }
             let payload = envelope.payload.clone();
             if let Some(buffer) = this.get_possibly_incomplete(buffer_id) {
                 let file = payload.file.context("invalid file")?;
@@ -1581,16 +1686,20 @@ impl BufferStore {
 
     pub fn reload_buffers(
         &self,
-        buffers: HashSet<Entity<Buffer>>,
+        mut buffers: HashSet<Entity<Buffer>>,
+        mode: ReloadMode,
         push_to_history: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectTransaction>> {
+        buffers.retain(|buffer| mode.should_reload(buffer.read(cx)));
         if buffers.is_empty() {
             return Task::ready(Ok(ProjectTransaction::default()));
         }
         match &self.state {
-            BufferStoreState::Local(this) => this.reload_buffers(buffers, push_to_history, cx),
-            BufferStoreState::Remote(this) => this.reload_buffers(buffers, push_to_history, cx),
+            BufferStoreState::Local(store) => {
+                store.reload_buffers(buffers, mode, push_to_history, cx)
+            }
+            BufferStoreState::Remote(store) => store.reload_buffers(buffers, push_to_history, cx),
         }
     }
 
@@ -1606,7 +1715,7 @@ impl BufferStore {
                 let buffer_id = BufferId::new(*buffer_id)?;
                 buffers.insert(this.get_existing(buffer_id)?);
             }
-            anyhow::Ok(this.reload_buffers(buffers, false, cx))
+            anyhow::Ok(this.reload_buffers(buffers, ReloadMode::DiscardChanges, false, cx))
         })?;
 
         let project_transaction = reload.await?;

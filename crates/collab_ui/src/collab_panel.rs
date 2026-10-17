@@ -562,9 +562,7 @@ impl CollabPanel {
 
     fn serialization_key(workspace: &Workspace) -> Option<String> {
         workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())
+            .serialization_scope()
             .map(|id| format!("{}-{:?}", COLLABORATION_PANEL_KEY, id))
     }
 

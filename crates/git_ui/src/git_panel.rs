@@ -546,7 +546,7 @@ pub enum Event {
     Focus,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SerializedGitPanel {
     #[serde(default)]
     signoff_enabled: bool,
@@ -1941,54 +1941,54 @@ impl GitPanel {
 
     fn serialization_key(workspace: &Workspace) -> Option<String> {
         workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or(workspace.session_id())
+            .serialization_scope()
             .map(|id| format!("{}-{:?}", GIT_PANEL_KEY, id))
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        let signoff_enabled = self.signoff_enabled;
-        let commit_editor_collapsed = self
-            .commit_editor_toggled
-            .then_some(self.commit_editor_collapsed);
-        let commit_messages = self.serialized_commit_messages(cx);
-        let kvp = KeyValueStore::global(cx);
-
+        cx.emit(PanelEvent::PersistenceChanged);
+        let serialized = self.serialized_state(cx);
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
             cx.background_executor()
                 .timer(SERIALIZATION_THROTTLE_TIME)
                 .await;
-            let Some(serialization_key) = git_panel
-                .update(cx, |git_panel, cx| {
-                    git_panel
-                        .workspace
-                        .read_with(cx, |workspace, _| Self::serialization_key(workspace))
-                        .ok()
-                        .flatten()
-                })
-                .ok()
-                .flatten()
-            else {
+            let Ok(write) = git_panel.update(cx, |git_panel, cx| {
+                let serialization_key = git_panel
+                    .workspace
+                    .read_with(cx, |workspace, _| Self::serialization_key(workspace))
+                    .ok()
+                    .flatten();
+                Self::write_serialized_state(serialized, serialization_key, cx)
+            }) else {
                 return;
             };
-            cx.background_spawn(
-                async move {
-                    kvp.write_kvp(
-                        serialization_key,
-                        serde_json::to_string(&SerializedGitPanel {
-                            signoff_enabled,
-                            commit_messages,
-                            commit_editor_collapsed,
-                        })?,
-                    )
-                    .await?;
-                    anyhow::Ok(())
-                }
-                .log_err(),
-            )
-            .await;
+            write.await.log_err();
         });
+    }
+
+    fn serialized_state(&self, cx: &App) -> SerializedGitPanel {
+        SerializedGitPanel {
+            signoff_enabled: self.signoff_enabled,
+            commit_messages: self.serialized_commit_messages(cx),
+            commit_editor_collapsed: self
+                .commit_editor_toggled
+                .then_some(self.commit_editor_collapsed),
+        }
+    }
+
+    fn write_serialized_state(
+        serialized: SerializedGitPanel,
+        serialization_key: Option<String>,
+        cx: &App,
+    ) -> Task<anyhow::Result<()>> {
+        let Some(serialization_key) = serialization_key else {
+            return Task::ready(Ok(()));
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            let serialized = serde_json::to_string(&serialized)?;
+            kvp.write_kvp(serialization_key, serialized).await
+        })
     }
 
     fn serialized_commit_messages(&self, cx: &App) -> BTreeMap<String, SerializedCommitMessage> {
@@ -9515,6 +9515,19 @@ impl Panel for GitPanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
+    fn flush_serialization(
+        &mut self,
+        workspace: &Workspace,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.pending_serialization = Task::ready(());
+        Self::write_serialized_state(
+            self.serialized_state(cx),
+            Self::serialization_key(workspace),
+            cx,
+        )
+    }
+
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
             settings.git_panel.get_or_insert_default().dock = Some(position.into())
@@ -12724,17 +12737,42 @@ mod tests {
         let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
 
         register_git_commit_language(&project, cx);
-        let panel = workspace.update_in(cx, GitPanel::new);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = GitPanel::new(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
         cx.run_until_parked();
+        let persistence_changes = Rc::new(Cell::new(0));
+        let _subscription = panel.update(cx, |_, cx| {
+            let persistence_changes = persistence_changes.clone();
+            cx.subscribe(&panel, move |_, _, event: &PanelEvent, _| {
+                if let PanelEvent::PersistenceChanged = event {
+                    persistence_changes.set(persistence_changes.get() + 1);
+                }
+            })
+        });
 
         let message_a = "Restore repository A message";
-        panel.update(cx, |panel, cx| {
-            panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
-                let start = buffer.anchor_before(0);
-                let end = buffer.anchor_after(buffer.len());
-                buffer.edit([(start..end, message_a)], None, cx);
+        workspace.update(cx, |_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                    let start = buffer.anchor_before(0);
+                    let end = buffer.anchor_after(buffer.len());
+                    buffer.edit([(start..end, message_a)], None, cx);
+                });
             });
         });
+        cx.run_until_parked();
+        assert_eq!(persistence_changes.get(), 1);
+        workspace
+            .update(cx, |workspace, cx| {
+                panel.update(cx, |panel, cx| panel.flush_serialization(workspace, cx))
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(persistence_changes.get(), 1);
 
         repository_b.update(cx, |repository, cx| repository.set_as_active_repository(cx));
         cx.run_until_parked();
