@@ -972,6 +972,22 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.request_frame.set(Some(callback));
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let hwnd = self.0.hwnd;
+        Some(Rc::new(move || {
+            unsafe {
+                let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE);
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        let hwnd = self.0.hwnd;
+        unsafe {
+            let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE);
+        }
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
         self.state.callbacks.input.set(Some(callback));
     }

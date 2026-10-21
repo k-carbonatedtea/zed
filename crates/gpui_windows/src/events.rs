@@ -1354,6 +1354,9 @@ impl WindowsWindowInner {
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
+        // 在绘制开始前验证当前脏区域，保证绘制期间产生的新的重绘请求（如 on_next_frame / schedule_frame / cx.notify）不会被冲掉
+        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
         self.state.direct_manipulation.update();
@@ -1387,7 +1390,6 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
-        unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
     }
